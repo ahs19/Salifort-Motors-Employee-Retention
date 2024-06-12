@@ -40,10 +40,6 @@ This model helps predict whether an employee will leave and identify which facto
 
 Conclusion
 
-Barplot above shows the most relevant variables: ‘last_evaluation’, ‘number_project’,  ‘tenure’ and ‘overworked’.
-In the random forest model above, `last_evaluation`, `tenure`, `number_project`, `overworked`, `salary_low`, and `work_accident` have the highest importance. These variables are most helpful in predicting the outcome variable, `left`.
-
-Insights/Next Steps
 Cap the number of projects that employees can work on.
 Consider promoting employees who have been with the company for at least four years, or conduct further investigation about why four-year tenured employees are so dissatisfied.
 Either reward employees for working longer hours, or don't require them to do so.
