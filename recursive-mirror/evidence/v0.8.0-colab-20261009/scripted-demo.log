@@ -1,0 +1,2 @@
+DEMO: deterministic scripted test double. Scores are software-test evidence only.
+{"calls":42,"claim":"measured_agent_strategy_and_self_prediction_only","committed_state_sha256":"ed9a0bd5b7ea452f1237acfc22dc4f64b6ee6cdc4d8857e54c0901aa03327b00","model_identity":"scripted-test-double","output":"/content/recursive_mirror_v080_20261009T052118Z_84d8e986/scripted_demo","status":"depth_limit","transfer_improved":true}

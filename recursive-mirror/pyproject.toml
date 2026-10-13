@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "digital-mirror-recursive"
+version = "0.8.0"
+description = "A recursive LLM harness for persistent strategy improvement and self-modelling"
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = []
+
+[project.scripts]
+recursive-mirror = "recursive_mirror.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["recursive_mirror*"]

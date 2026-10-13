@@ -1,0 +1,26 @@
+`torch_dtype` is deprecated! Use `dtype` instead!
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1791524043.835153    4114 cpu_feature_guard.cc:227] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: AVX2 AVX512F FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1791524046.932193    4114 cudart_stub.cc:31] Could not find cuda drivers on your machine, GPU will not be used.
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:13<00:13, 13.67s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:23<00:00, 11.68s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:23<00:00, 11.98s/it]
+The following generation flags are not valid and may be ignored: ['temperature', 'top_p', 'top_k']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+{
+  "status": "depth_limit",
+  "calls": 30,
+  "transfer_improved": false,
+  "initial_final_metrics": {
+    "accuracy": 1.0,
+    "brier": 0.021050000000000006,
+    "forecast_coverage": 1.0,
+    "n": 2
+  },
+  "candidate_final_metrics": {
+    "accuracy": 0.5,
+    "brier": 0.33125000000000004,
+    "forecast_coverage": 1.0,
+    "n": 2
+  },
+  "claim": "measured_agent_strategy_and_self_prediction_only"
+}

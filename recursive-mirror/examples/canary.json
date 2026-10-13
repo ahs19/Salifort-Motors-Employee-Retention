@@ -1,0 +1,24 @@
+{
+  "rounds": [
+    {
+      "discovery": [
+        {"task_id": "r1-discovery", "category": "arithmetic", "prompt": "What is 17 + 26? Return the integer only.", "expected": "43"}
+      ],
+      "validation": [
+        {"task_id": "r1-validation", "category": "arithmetic", "prompt": "What is 38 + 47? Return the integer only.", "expected": "85"}
+      ]
+    },
+    {
+      "discovery": [
+        {"task_id": "r2-discovery", "category": "arithmetic", "prompt": "What is 19 multiplied by 6? Return the integer only.", "expected": "114"}
+      ],
+      "validation": [
+        {"task_id": "r2-validation", "category": "arithmetic", "prompt": "What is 27 multiplied by 8? Return the integer only.", "expected": "216"}
+      ]
+    }
+  ],
+  "final_tasks": [
+    {"task_id": "final-1", "category": "arithmetic", "prompt": "What is 56 + 79? Return the integer only.", "expected": "135"},
+    {"task_id": "final-2", "category": "arithmetic", "prompt": "What is 34 multiplied by 7? Return the integer only.", "expected": "238"}
+  ]
+}

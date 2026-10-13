@@ -1,0 +1,10 @@
+`torch_dtype` is deprecated! Use `dtype` instead!
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1791523371.501464    1086 cpu_feature_guard.cc:227] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: AVX2 AVX512F FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1791523374.577003    1086 cudart_stub.cc:31] Could not find cuda drivers on your machine, GPU will not be used.
+Fetching 2 files:   0%|          | 0/2 [00:00<?, ?it/s]Fetching 2 files:  50%|█████     | 1/2 [01:12<01:12, 72.79s/it]Fetching 2 files: 100%|██████████| 2/2 [01:12<00:00, 36.40s/it]
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:13<00:13, 13.84s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:23<00:00, 11.67s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:23<00:00, 12.00s/it]
+The following generation flags are not valid and may be ignored: ['temperature', 'top_p', 'top_k']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+GenerationFailure: Generation reached its token limit without EOS; partial output rejected.

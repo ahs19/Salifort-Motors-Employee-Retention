@@ -1,0 +1,12 @@
+{
+  "change": "Config.max_new_tokens: 384 -> 768",
+  "model_access": "existing cache only; downloads disabled",
+  "source_zip_sha256": "cbca0fe06030bcf3013de8a5bbbe68b2e6374ec04cbaa1d3cc5fc58c43bb9f37",
+  "runner_sha256": "3bb4b5b5fd96247979bdfe3bcea179619909f9a2b51133a909f4509f0953d9e4",
+  "max_depth": 2,
+  "max_calls": 40,
+  "timeout_seconds": 1800,
+  "prior_run": "real_trial",
+  "new_run": "token768_followup/trial",
+  "claim_boundary": "bounded canary; no awareness or generalization claim"
+}
