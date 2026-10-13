@@ -30,7 +30,7 @@ does not certify it.
 
 The last cell downloads `…_evidence.zip`. If any cell stops with an error, run
 that last cell by hand: it exports everything produced so far. The default
-settings take about 1.5 hours on a T4.
+settings take about 2 hours on a T4.
 
 The notebook works through these steps in order:
 
@@ -169,7 +169,15 @@ then pools the held-out final tasks across seeds to answer three questions:
    prompt?
 
 Each run also has its own `report.md`, and `summary.md` includes held-out
-accuracy per task type. Task plans come from `make-plan`: exact-answer tasks
+accuracy per task type. By default each seed's plan has 3 levels of 12
+discovery and 24 validation tasks, plus 48 final tasks, so three seeds pool
+144 held-out tasks per comparison.
+
+These sizes come from a power analysis by one of the reviewers. For a
+genuine +15-point improvement, the chance of passing the gate at least once
+in a run is about 0.79, and the final test passes it with power about 0.88.
+At 12 validation and 24 final tasks, the chance of committing it was only
+about 0.49. Task plans come from `make-plan`: exact-answer tasks
 with headroom for small models (multi-digit multiplication, letter counting,
 word reversal, decimal comparison, multi-step arithmetic, weekday offsets).
 Python computes every answer, and every plan is disjoint across its splits.
@@ -189,9 +197,10 @@ evidence. The real-stack integration tests are opt-in: with `torch`,
 `RECURSIVE_MIRROR_TEST_DEVICE=cpu` (or `cuda`).
 
 ```powershell
-python -m recursive_mirror make-plan --output plans/seed7.json --seed 7 --rounds 3 --discovery 12 --validation 12 --final 24
+python -m recursive_mirror make-plan --output plans/seed7.json --seed 7 --rounds 3 --discovery 12 --validation 24 --final 48
+python -m recursive_mirror make-plan --output plans/next.json --seed 8 --exclude-state runs/real-001/checkpoint.json
 python -m recursive_mirror run --plan examples/headroom.json --output runs/real-001 --model Qwen/Qwen2.5-3B-Instruct --revision aa8e72537993ba99e69dfaafa59ed015b17504d1 --allow-download --device cuda --max-depth 2 --max-calls 240
-python -m recursive_mirror experiment --output runs/exp-001 --model Qwen/Qwen2.5-3B-Instruct --revision aa8e72537993ba99e69dfaafa59ed015b17504d1 --allow-download --device cuda --seeds 2026,2027,2028 --max-depth 3 --max-calls 420
+python -m recursive_mirror experiment --output runs/exp-001 --model Qwen/Qwen2.5-3B-Instruct --revision aa8e72537993ba99e69dfaafa59ed015b17504d1 --allow-download --device cuda --seeds 2026,2027,2028 --max-depth 3 --max-calls 720
 python -m recursive_mirror summarize runs/exp-001
 python -m recursive_mirror diagnose runs/exp-001/seed-2026/self
 ```
@@ -214,7 +223,10 @@ Remote downloads require `--allow-download` and an immutable 40-character
 `--revision`. Each real call records its input and output tokens, revision,
 device, dtype, decoding and generation time. These receipts do not
 independently verify model-weight bytes. Checkpoints are hash-checked (format
-v2, which adds the attempt ledger); v1 checkpoints from v0.8 still load. Their
+v2, which adds the attempt ledger); v1 checkpoints from v0.8 still load. To
+continue a committed checkpoint, generate the next plan with `make-plan
+--exclude-state <checkpoint>` so that no prompt repeats. A stale plan is
+refused before any run directory is created. Their
 backend identity differs, because v0.8 decoding was not purely greedy, so they
 continue through the Python API rather than the CLI.
 

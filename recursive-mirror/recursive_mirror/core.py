@@ -508,6 +508,8 @@ class Result:
     model_identity: str
     plan_sha256: str
     config: Config
+    initial_strategy: str = ""
+    initial_self_model: str = ""
     protocol: str = PROTOCOL
     claim: str = "measured_agent_strategy_and_self_prediction_only"
 
@@ -560,6 +562,13 @@ PROPOSAL_BRIEFS = {
                 "a substantially different approach from the current strategy and from the previous "
                 "attempts, while addressing the observed errors."),
 }
+
+
+def stale_tasks(plan: Plan, state: State) -> list[str]:
+    """Task IDs of the plan whose ID or normalized prompt already appears in the state's history."""
+    old_ids = {o.task_id for o in state.observations}
+    old_prompts = {o.prompt_sha256 for o in state.observations}
+    return [t.task_id for t in plan.tasks() if t.task_id in old_ids or fingerprint(t.prompt) in old_prompts]
 
 
 class RecursiveMirror:
@@ -1012,16 +1021,16 @@ class RecursiveMirror:
         initial = initial or State()
         # A loaded state carries its evaluation exposure forward. Fresh IDs alone
         # cannot conceal an exact prompt reused from a previous run.
-        old_ids = {o.task_id for o in initial.observations}
-        old_prompts = {o.prompt_sha256 for o in initial.observations}
-        if any(not re.fullmatch(r"[0-9a-f]{64}", h) for h in old_prompts):
+        if any(not re.fullmatch(r"[0-9a-f]{64}", o.prompt_sha256) for o in initial.observations):
             raise ValueError("Initial observation history lacks valid prompt fingerprints")
-        for task in self.plan.tasks():
-            if task.task_id in old_ids or fingerprint(task.prompt) in old_prompts:
-                raise ValueError("A continued run requires fresh task IDs and prompts")
+        stale = stale_tasks(self.plan, initial)
+        if stale:
+            raise ValueError(f"A continued run requires fresh task IDs and prompts; {stale[0]} was already "
+                             "used (make-plan --exclude-state avoids this)")
         self.emit({"event": "run_started", "protocol": PROTOCOL,
                    "config": asdict(self.config), "plan_sha256": digest(asdict(self.plan)),
-                   "initial_state_sha256": initial.sha256, "model_identity": self.model.identity,
+                   "initial_state_sha256": initial.sha256, "initial_strategy": initial.strategy,
+                   "initial_self_model": initial.self_model, "model_identity": self.model.identity,
                    "deterministic_cache": self._deterministic})
         try:
             candidate, reason = self._recurse(initial, 0, 0)
@@ -1045,7 +1054,7 @@ class RecursiveMirror:
                 attempts=candidate.attempts)
             result = Result(reason, self.calls, self.cache_hits, tuple(self.steps), candidate, committed,
                             final.parent, final.candidate, final, transfer, self.model.identity,
-                            digest(asdict(self.plan)), self.config)
+                            digest(asdict(self.plan)), self.config, initial.strategy, initial.self_model)
             self.emit({"event": "run_completed", "result": asdict(result)})
             return result
         except Exception as exc:

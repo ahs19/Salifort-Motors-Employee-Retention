@@ -82,9 +82,9 @@ class ReleaseTests(unittest.TestCase):
         from recursive_mirror.runtime import load_plan
         from recursive_mirror.tasks import generate_plan
         model = type("M", (), {"identity": "budget-check"})()
-        plan = generate_plan(2026, rounds=3, discovery=12, validation=12, final=24)
-        engine = RecursiveMirror(model, plan, Config(max_depth=3, max_calls=420))
-        self.assertEqual(sum(engine._round_cost(r) for r in plan.rounds) + engine._final_reserve, 399)
+        plan = generate_plan(2026, rounds=3, discovery=12, validation=24, final=48)
+        engine = RecursiveMirror(model, plan, Config(max_depth=3, max_calls=720))
+        self.assertEqual(sum(engine._round_cost(r) for r in plan.rounds) + engine._final_reserve, 711)
         shipped = load_plan(Path(__file__).resolve().parents[1] / "examples" / "headroom.json")
         engine = RecursiveMirror(model, shipped, Config(max_depth=2, max_calls=240))
         self.assertEqual(sum(engine._round_cost(r) for r in shipped.rounds[:2]) + engine._final_reserve, 218)

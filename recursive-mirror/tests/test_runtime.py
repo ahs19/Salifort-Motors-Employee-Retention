@@ -11,10 +11,11 @@ from unittest.mock import Mock, patch
 
 from recursive_mirror.cli import main
 from recursive_mirror.core import (Attempt, Config, OutputTruncated, Perspective, RecursiveMirror, Request,
-                                   State, canonical, digest)
+                                   State, canonical, digest, fingerprint)
 from recursive_mirror.demo import ScriptedTestDouble, demo_plan
 from recursive_mirror.runtime import (GenerationFailure, HuggingFaceBackend, checkpoint_for,
-                                     execute, load_checkpoint, load_plan, plan_from_dict, read_json)
+                                     execute, load_checkpoint, load_plan, plan_from_dict, read_json,
+                                     render_report)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,7 +65,9 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(load_plan(output / "plan.json"), demo_plan())
         self.assertEqual(events[-1]["event"], "runtime_completed")
         report = (output / "report.md").read_text(encoding="utf-8")
-        self.assertIn("beat the initial policy on the held-out final tasks", report)
+        self.assertIn("answered more held-out final tasks correctly (0% -> 100%) and was committed", report)
+        self.assertIn("## Initial policy", report)
+        self.assertIn(State().strategy, report)
         self.assertIn("| repair | **selected** (`accuracy_gain`) | 0% -> 100%", report)
         self.assertIn(ScriptedTestDouble.FIXED, report)
         self.assertIn("Nothing here certifies awareness", report)
@@ -391,6 +394,36 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("software-test evidence only", stdout.getvalue())
         self.assertIn("scripted-test-double", stdout.getvalue())
         self.assertIn("FileExistsError", stderr.getvalue())
+
+    def test_report_names_each_outcome_honestly(self):
+        result = demo_result()
+        no_level = replace(result, steps=(), status="call_budget", transfer_improved=False)
+        self.assertIn("no improvement level ran (stop reason `call_budget`)", render_report(no_level))
+        rolled_back = replace(result, transfer_improved=False)
+        self.assertIn("did not transfer to the held-out final tasks", render_report(rolled_back))
+        calibration = replace(result, final_comparison=replace(result.final_comparison, reason="calibration_gain"))
+        self.assertIn("forecast its own success better on held-out final tasks", render_report(calibration))
+
+    def test_continuation_with_a_fresh_excluded_plan_and_refusal_before_any_directory(self):
+        first = self.root / "first"
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["demo", "--output", str(first)]), 0)
+        checkpoint = first / "checkpoint.json"
+        plan_path = self.root / "plans" / "next.json"
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["make-plan", "--output", str(plan_path), "--seed", "9", "--rounds", "1",
+                                   "--discovery", "2", "--validation", "2", "--final", "2",
+                                   "--exclude-state", str(checkpoint)]), 0)
+        used = {o.prompt_sha256 for o in load_checkpoint(checkpoint).observations}
+        self.assertFalse({fingerprint(t.prompt) for t in load_plan(plan_path).tasks()} & used)
+        stale_plan = self.write_json("stale.json", asdict(demo_plan()))
+        output = self.root / "refused"
+        with patch("recursive_mirror.cli.HuggingFaceBackend", return_value=ScriptedTestDouble()), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(main(["run", "--plan", str(stale_plan), "--output", str(output), "--model", "m",
+                                   "--state", str(checkpoint)]), 1)
+        self.assertIn("discover-1 was already used", stderr.getvalue())
+        self.assertFalse(output.exists())
 
     def test_cli_make_plan_writes_a_loadable_plan_and_refuses_overwrite(self):
         target = self.root / "plan.json"

@@ -35,7 +35,7 @@ SUMMARY_FORMAT = "recursive-mirror-experiment-summary-v1"
 
 
 def run_experiment(model: LanguageModel, output: str | Path, *, seeds: tuple[int, ...], config: Config,
-                   rounds: int = 3, discovery: int = 8, validation: int = 12, final: int = 24,
+                   rounds: int = 3, discovery: int = 12, validation: int = 24, final: int = 48,
                    categories: tuple[str, ...] = CATEGORIES, control_strategy: str | None = DEFAULT_CONTROL_STRATEGY,
                    log: Callable[[str], None] = print) -> dict:
     """Run every seed (and control) in order; one failed run never discards the others."""

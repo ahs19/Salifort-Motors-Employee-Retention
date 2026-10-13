@@ -12,7 +12,7 @@ from __future__ import annotations
 import random
 from typing import Callable
 
-from .core import Plan, Round, Task, normalize
+from .core import Plan, Round, Task, fingerprint, normalize
 
 
 WORDS = tuple(dict.fromkeys("""
@@ -26,6 +26,19 @@ bubble cottage dessert assistant programming algorithm statistics attention pota
 chocolate harmony terrible horrible irregular abbreviation aggressive barrier bassoon
 collection connection currency daffodil effective fluffy goggles guerrilla hippopotamus
 innocent juggler llama narrator offense panorama reservoir sheriff tattoo woodpecker zucchini
+abundance accessory allergy ambassador anniversary apparatus applause archipelago arrangement
+avocado baggage bamboo barrel bazaar beggar billboard blossom boomerang bottleneck buccaneer
+buffalo bulletin cassette caterpillar cellar cheerful chimpanzee cinnamon classroom coconut
+colossal commission companion corridor courageous crocodile cuttlefish dazzling dilemma dinner
+doorbell dwelling eggplant elegant embassy engineering essential excellence feedback ferrari
+fiddle football forgotten gallery garrison giggle glossary gorilla grassland guitar hallway
+harrison helicopter hollow horrify immense intelligent javelin kettle knapsack lollipop luggage
+mammoth massive mattress meadowlark messenger millipede mission moccasin monsoon mosquito
+mozzarella muffin narrow necessity nugget occasion opponent oregano paddle pajamas passenger
+peppermint pheasant pizzeria possible quizzical rattlesnake recommend referral riddle saddle
+satellite seesaw shuffle skillet slippery spaghettini squirrel steeplechase stubborn succotash
+suggestion summit sunflower syllable tattletale teepee terrific thrilling tomorrowland tunnel
+typhoon vacuum vessel villa volleyball waffle warrior wednesday whippoorwill wobble yellowbellied
 """.split()))
 
 WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
@@ -108,8 +121,13 @@ CATEGORIES = tuple(GENERATORS)
 
 
 def generate_plan(seed: int = 2026, rounds: int = 2, discovery: int = 6, validation: int = 10,
-                  final: int = 16, categories: tuple[str, ...] = CATEGORIES) -> Plan:
-    """Build a plan whose task IDs and normalized prompts are disjoint across all splits."""
+                  final: int = 16, categories: tuple[str, ...] = CATEGORIES,
+                  exclude: frozenset[str] | set[str] = frozenset()) -> Plan:
+    """Build a plan whose task IDs and normalized prompts are disjoint across all splits.
+
+    exclude holds prompt fingerprints (core.fingerprint) already seen, for
+    example by a checkpoint, so a continued run gets only fresh prompts.
+    """
     for name, value, low in (("seed", seed, 0), ("rounds", rounds, 1), ("discovery", discovery, 1),
                              ("validation", validation, 1), ("final", final, 1)):
         if type(value) is not int or value < low:
@@ -127,7 +145,7 @@ def generate_plan(seed: int = 2026, rounds: int = 2, discovery: int = 6, validat
             category = order[index % len(order)]
             for _ in range(1000):
                 prompt, expected = GENERATORS[category](rng)
-                if normalize(prompt) not in seen:
+                if normalize(prompt) not in seen and fingerprint(prompt) not in exclude:
                     break
             else:
                 raise ValueError(f"Could not generate enough distinct {category} tasks")

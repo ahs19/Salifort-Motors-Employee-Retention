@@ -6,7 +6,7 @@ from dataclasses import asdict
 from pathlib import Path
 import sys
 
-from .core import Config, RecursiveMirror, State, canonical
+from .core import Config, RecursiveMirror, State, canonical, stale_tasks
 from .demo import ScriptedTestDouble, demo_plan
 from .diagnostics import diagnose, diagnosis_markdown
 from .experiment import DEFAULT_CONTROL_STRATEGY, run_experiment, summary_markdown, write_summary
@@ -43,6 +43,7 @@ def parser() -> argparse.ArgumentParser:
     make.add_argument("--validation", type=int, default=10)
     make.add_argument("--final", type=int, default=16)
     make.add_argument("--categories", type=_categories, default=CATEGORIES)
+    make.add_argument("--exclude-state", help="Checkpoint whose already-used prompts the new plan must avoid")
 
     run = commands.add_parser("run", help="Run a real local Hugging Face model on an explicit plan")
     run.add_argument("--plan", required=True)
@@ -51,8 +52,8 @@ def parser() -> argparse.ArgumentParser:
     experiment.add_argument("--seeds", type=_seeds, default=(2026, 2027, 2028))
     experiment.add_argument("--rounds", type=int, default=3)
     experiment.add_argument("--discovery", type=int, default=8)
-    experiment.add_argument("--validation", type=int, default=12)
-    experiment.add_argument("--final", type=int, default=24)
+    experiment.add_argument("--validation", type=int, default=24)
+    experiment.add_argument("--final", type=int, default=48)
     experiment.add_argument("--categories", type=_categories, default=CATEGORIES)
     experiment.add_argument("--control-strategy", default=DEFAULT_CONTROL_STRATEGY,
                             help="Hand-written starting strategy for the control arm ('' disables it)")
@@ -112,8 +113,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         if args.command == "make-plan":
+            used = load_checkpoint(args.exclude_state) if args.exclude_state else State()
             plan = generate_plan(args.seed, args.rounds, args.discovery, args.validation, args.final,
-                                 args.categories)
+                                 args.categories, exclude={o.prompt_sha256 for o in used.observations})
+            stale = stale_tasks(plan, used)
+            if stale:
+                raise ValueError(f"task ID {stale[0]} was already used by that checkpoint; choose another --seed")
+            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
             _save_exclusive(Path(args.output), asdict(plan))
             print(canonical({"plan": args.output, "rounds": len(plan.rounds),
                              "tasks": len(plan.tasks()), "categories": list(args.categories)}), flush=True)
@@ -157,6 +163,10 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("--initial-strategy/--initial-self-model cannot be combined with --state")
             initial = (load_checkpoint(args.state, expected_model_identity=model.identity) if args.state
                        else State(**custom) if custom else None)
+            stale = stale_tasks(plan, initial) if initial is not None else []
+            if stale:  # refuse before any run directory is created
+                raise ValueError(f"A continued run requires fresh task IDs and prompts; {stale[0]} was already "
+                                 "used (make-plan --exclude-state avoids this)")
         result = execute(model, plan, args.output, config, initial)
         print(canonical({"status": result.status, "calls": result.calls, "cache_hits": result.cache_hits,
                          "model_identity": result.model_identity,

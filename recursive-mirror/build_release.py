@@ -86,7 +86,7 @@ What the cells do, in order:
    test. A control arm repeats this from a hand-written step-by-step prompt;
 5. pool the held-out results across plans and export all evidence.
 
-Expected time with the default settings: about 1.5 hours on a T4, less on L4/A100.
+Expected time with the default settings: about 2 hours on a T4, less on L4/A100.
 Use the settings cell to shorten it (for example fewer `SEEDS`).
 If any cell stops with an error, run the **last cell** by hand: it exports
 everything produced so far, including logs of the failure.
@@ -141,8 +141,8 @@ general self-improvement, changed weights, or subjective awareness.
         REVISION = "aa8e72537993ba99e69dfaafa59ed015b17504d1"  # pinned commit of MODEL; change both together
         SEEDS = "2026,2027,2028"      # independent task plans; fewer seeds = shorter run, weaker evidence
         RUN_CONTROL = True            # also start from a hand-written step-by-step prompt
-        ROUNDS, DISCOVERY, VALIDATION, FINAL = 3, 12, 12, 24
-        MAX_CALLS_PER_RUN = 420       # 3 levels need at most 399 calls with these sizes
+        ROUNDS, DISCOVERY, VALIDATION, FINAL = 3, 12, 24, 48   # larger validation/final sets = more power
+        MAX_CALLS_PER_RUN = 720       # 3 levels need at most 711 calls with these sizes
         TOTAL_HOURS = 4.0             # wall-clock budget shared by all runs of the main experiment
         print({"model": MODEL, "seeds": SEEDS, "control": RUN_CONTROL, "hours": TOTAL_HOURS})
     ''')

@@ -14,15 +14,15 @@ preflight cell is the first real-model check.
 
 ```text
 python -B -m unittest discover -s tests -v
-  Python 3.11, 3.12, 3.13 (standard library only): 102 tests, OK (7 opt-in skipped)
+  Python 3.11, 3.12, 3.13 (standard library only): 104 tests, OK (7 opt-in skipped)
 RECURSIVE_MIRROR_TEST_DEVICE=cpu python -B -m unittest discover -s tests
-  Python 3.12 + torch 2.14.1 + transformers 4.57.6: 102 tests, OK
+  Python 3.12 + torch 2.14.1 + transformers 4.57.6: 104 tests, OK
 ```
 
 | test module | tests | covers |
 |---|---|---|
 | test_core | 57 | the recursive engine (details below) |
-| test_runtime | 22 | checkpoints, the HF backend, the CLI |
+| test_runtime | 24 | checkpoints, the HF backend, the CLI, report wording, `--exclude-state` continuation |
 | test_tasks | 6 | `make-plan`, re-deriving every expected answer from the prompt text |
 | test_experiment | 4 | replicated runs, control arm, failure isolation, pooled statistics, CLI |
 | test_release | 6 | archive, notebook order and budgets; the committed release must embed exactly the current sources |
@@ -90,6 +90,11 @@ Four specialist reviewers each had a paired skeptic:
 
 Confirmed or adopted findings are documented in
 `docs/v0.8-trial-review.md` under "Found before the first v0.9 run".
+
+The statistical-power finding changed the experiment sizes to 24 validation
+and 48 final tasks per seed. For a genuine +15-point improvement, the chance
+of committing it in a run rises from about 0.49 to about 0.79, and the
+pooled analysis covers 144 held-out tasks.
 
 ## What this does not establish
 

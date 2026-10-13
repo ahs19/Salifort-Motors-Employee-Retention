@@ -261,9 +261,16 @@ def render_report(result: Result) -> str:
              "deterministic cache hits)",
              f"- Levels completed: {len(result.steps)}; accepted improvements: "
              f"{sum(s.accepted for s in result.steps)}"]
-    if result.transfer_improved:
-        lines.append("- **Outcome: the self-improved policy beat the initial policy on the held-out final "
-                     "tasks and was committed.**")
+    if not result.steps:
+        lines.append(f"- **Outcome: no improvement level ran (stop reason `{result.status}`); only the "
+                     "initial policy was evaluated.**")
+    elif result.transfer_improved and final.reason == "accuracy_gain":
+        lines.append(f"- **Outcome: the self-improved policy answered more held-out final tasks correctly "
+                     f"({_pct(final.parent.accuracy)} -> {_pct(final.candidate.accuracy)}) and was committed.**")
+    elif result.transfer_improved:
+        lines.append(f"- **Outcome: the self-improved policy forecast its own success better on held-out "
+                     f"final tasks (Brier {_num(final.parent.brier)} -> {_num(final.candidate.brier)}; accuracy "
+                     f"{_pct(final.parent.accuracy)} -> {_pct(final.candidate.accuracy)}) and was committed.**")
     elif any(s.accepted for s in result.steps):
         lines.append("- **Outcome: a policy improved on validation but did not transfer to the held-out "
                      "final tasks; the committed policy was rolled back to the initial one.**")
@@ -305,7 +312,9 @@ def render_report(result: Result) -> str:
                           "", "</details>"]
         lines.append("")
     committed = result.committed_state
-    lines += ["## Committed policy", "", "Strategy:", "", "```text", committed.strategy, "```", "",
+    lines += ["## Initial policy", "", "Strategy:", "", "```text", result.initial_strategy or "(not recorded)",
+              "```", "", "Self-model:", "", "```text", result.initial_self_model or "(not recorded)", "```", "",
+              "## Committed policy", "", "Strategy:", "", "```text", committed.strategy, "```", "",
               "Self-model:", "", "```text", committed.self_model, "```", "",
               "## Claim boundary", "",
               "This run measures whether an inference-time strategy and self-model, revised by the "
