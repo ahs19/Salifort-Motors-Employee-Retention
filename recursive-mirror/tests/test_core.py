@@ -5,9 +5,10 @@ from dataclasses import replace
 import inspect
 import re
 import unittest
+import unittest.mock
 
 from recursive_mirror.core import (
-    Config, Metrics, Observation, OutputTruncated, Plan, RecursiveMirror, Round, State, Task,
+    Config, Metrics, Observation, OutputTruncated, Plan, RecursiveMirror, Request, Round, State, Task, render,
     compare, digest, extract_answer, normalize_answer, paired_p_value, parse_forecast, sections, summarize,
 )
 
@@ -29,7 +30,7 @@ def task_id(request):
 
 
 def level(request):
-    return int(re.search(r"Recursive level (\d+)", sections(request.prompt)["FRAME"]).group(1))
+    return int(re.search(r"Level (\d+) of", sections(request.prompt)["FRAME"]).group(1)) - 1
 
 
 def strategy_of(parts):
@@ -116,8 +117,8 @@ class RecursiveExecutionTests(unittest.TestCase):
             ("recursive_return", 2), ("recursive_return", 1), ("recursive_return", 0),
         ])
         self.assertEqual(result.status, "plan_exhausted")
-        # Per level: 2 discovery + 3 views + 3 proposal calls + 2 parent + 2x2 candidates.
-        self.assertEqual(result.calls, 3 * 14 + 4)
+        # Per level: 2 discovery + 3 views + 2 proposal calls (one per kind) + 2 parent + 2x2 candidates.
+        self.assertEqual(result.calls, 3 * 13 + 4)
         self.assertEqual(result.cache_hits, 0)
         self.assertTrue(all(step.accepted for step in result.steps))
         self.assertEqual([s.selected_kind for s in result.steps], ["repair"] * 3)
@@ -181,7 +182,7 @@ class RecursiveExecutionTests(unittest.TestCase):
                     if request.purpose in ("forecast", "answer"):
                         self.assertNotIn("KEY_", text)
                 reflections = [r for r in model.requests if r.purpose.startswith(("perspective:", "revise_"))]
-                self.assertEqual(len(reflections), 12)
+                self.assertEqual(len(reflections), 10)
                 for request in reflections:
                     key = plan.rounds[level(request)].discovery[0].expected
                     self.assertEqual(f"Reference answer: {key}" in request.prompt, reveal)
@@ -314,7 +315,7 @@ class RecursiveExecutionTests(unittest.TestCase):
                          [("repair", False, "unchanged"), ("recalibrate", False, "unchanged")])
         validation = [r for r in model.requests if task_id(r) == "validation-0"]
         self.assertEqual(len(validation), 2)
-        self.assertEqual(result.calls, 2 + 3 + 3 + 2 + 4)
+        self.assertEqual(result.calls, 2 + 3 + 2 + 2 + 4)
 
     def test_instance_is_one_use_after_success(self):
         _, model, events, engine = run_case(plan=make_plan(1))
@@ -358,10 +359,8 @@ class EvidenceRegressionTests(unittest.TestCase):
             "truncated": (lambda req: (_ for _ in ()).throw(OutputTruncated("limit", "Propose expanding"))
                           if req.purpose == "revise_strategy:repair" else None, "strategy_truncated"),
             "empty": (lambda req: "   " if req.purpose == "revise_strategy:repair" else None, "strategy_empty"),
-            "long": (lambda req: "x" * 1501 if req.purpose == "revise_strategy:repair" else None,
+            "long": (lambda req: "x" * 2401 if req.purpose == "revise_strategy:repair" else None,
                      "strategy_too_long"),
-            "self_model": (lambda req: "" if req.purpose == "revise_self_model:repair" else None,
-                           "self_model_empty"),
         }
         for name, (override, reason) in cases.items():
             with self.subTest(name=name):
@@ -370,6 +369,53 @@ class EvidenceRegressionTests(unittest.TestCase):
                 self.assertEqual((repair.kind, repair.eligible, repair.reason), ("repair", False, reason))
                 attempt = result.committed_state.attempts[0]
                 self.assertEqual((attempt.outcome, attempt.reason), ("ineligible", reason))
+
+    def test_each_kind_moves_one_lever(self):
+        # v0.8's real self-model replies ran to 1541 characters; a strategy proposal must not
+        # depend on one. Strategy kinds keep the parent's self-model; only recalibrate changes it.
+        for reply in ("", "y" * 2401):
+            with self.subTest(length=len(reply)):
+                override = lambda req: reply if req.purpose.startswith("revise_self_model:") else None  # noqa: E731
+                result, model, _, _ = run_case(FakeModel(override=override), make_plan(1))
+                repair, recalibrate = result.steps[0].candidates
+                self.assertTrue(repair.eligible)
+                self.assertEqual((repair.strategy, repair.self_model), ("strategy-1", INITIAL.self_model))
+                self.assertFalse(recalibrate.eligible)
+                self.assertTrue(recalibrate.reason.startswith("self_model_"))
+                self.assertEqual(recalibrate.strategy, INITIAL.strategy)
+                self.assertEqual([r.purpose for r in model.requests if r.purpose.startswith("revise_")],
+                                 ["revise_strategy:repair", "revise_self_model:recalibrate"])
+
+    def test_non_executable_strategy_advice_is_screened_before_validation(self):
+        override = lambda req: ("Propose expanding the training dataset and add a feedback loop."  # noqa: E731
+                                if req.purpose == "revise_strategy:repair" else None)
+        result, model, _, _ = run_case(FakeModel(override=override), make_plan(1))
+        repair = result.steps[0].candidates[0]
+        self.assertEqual((repair.eligible, repair.reason), (False, "strategy_non_executable"))
+
+    def test_forecast_that_is_the_task_answer_is_not_a_probability(self):
+        # v0.8 trial 2: the forecast call returned "216", the answer to 27 x 8.
+        plan = Plan((Round((Task("d", "Count it.", "3"),), (Task("v", "Count that.", "2"),)),),
+                    (Task("f", "Count this.", "4"),))
+
+        def evaluation(req, parts):
+            if req.purpose == "answer":
+                return "ANSWER: 3"
+            return {"Count it.": "3", "Count that.": "2%", "Count this.": "70"}[parts["TASK"].split("\n", 1)[1]]
+
+        result, _, _, _ = run_case(FakeModel(evaluation), plan)
+        by_task = {o.task_id: o for o in result.committed_state.observations}
+        self.assertIsNone(by_task["d"].probability)          # bare "3" equals the answer key
+        self.assertEqual(by_task["v"].probability, 0.02)     # explicit percentage is a forecast
+        self.assertEqual(by_task["f"].probability, 0.7)
+
+    def test_wall_clock_budget_stops_recursion_but_keeps_the_final_test(self):
+        engine = RecursiveMirror(FakeModel(), make_plan(3), C(max_seconds=1))
+        with unittest.mock.patch("recursive_mirror.core.time.monotonic", side_effect=[0.0, 0.5, 5.0, 5.0, 5.0]):
+            result = engine.run(INITIAL)
+        self.assertEqual(result.status, "time_budget")
+        self.assertEqual(len(result.steps), 1)
+        self.assertEqual(result.final_comparison.parent.n, 1)
 
     def test_parent_forecast_failure_cannot_create_candidate_calibration_gain(self):
         # v0.8 trial 2, level 1: the parent echoed "216" instead of a probability,
@@ -424,15 +470,15 @@ class BudgetAndAuditTests(unittest.TestCase):
 
     def test_round_cannot_consume_final_reserve(self):
         model = FakeModel()
-        result = RecursiveMirror(model, make_plan(3), C(max_calls=14 + 4 + 13)).run(INITIAL)
+        result = RecursiveMirror(model, make_plan(3), C(max_calls=13 + 4 + 12)).run(INITIAL)
         self.assertEqual(result.status, "call_budget")
         self.assertEqual(len(result.steps), 1)
-        self.assertEqual(result.calls, 18)
+        self.assertEqual(result.calls, 17)
         self.assertEqual([task_id(req) for req in model.requests[-4:]], ["final-0"] * 4)
 
     def test_exact_budget_allows_complete_round_and_final_test(self):
-        result = RecursiveMirror(FakeModel(), make_plan(1), C(max_calls=18)).run(INITIAL)
-        self.assertEqual(result.calls, 18)
+        result = RecursiveMirror(FakeModel(), make_plan(1), C(max_calls=17)).run(INITIAL)
+        self.assertEqual(result.calls, 17)
         self.assertEqual(result.status, "plan_exhausted")
         self.assertTrue(result.transfer_improved)
 
@@ -500,7 +546,7 @@ class DeterministicCacheTests(unittest.TestCase):
         hits = [e for e in events if e["event"] == "llm_cache_hit"]
         self.assertEqual([e["purpose"] for e in hits], ["answer"])
         self.assertEqual(result.cache_hits, 1)
-        self.assertEqual(result.calls, 18 - 1)
+        self.assertEqual(result.calls, 17 - 1)
         self.assertEqual(len(model.requests), result.calls)
         parent = next(o for o in result.committed_state.observations if o.phase == "validation_parent")
         recal = next(o for o in result.committed_state.observations if o.arm == "recalibrate")
@@ -520,13 +566,99 @@ class DeterministicCacheTests(unittest.TestCase):
         result, model, events, _ = run_case(FakeModel(deterministic=False), make_plan(1))
         self.assertEqual(result.cache_hits, 0)
         self.assertFalse(any(e["event"] == "llm_cache_hit" for e in events))
-        self.assertEqual(len(model.requests), 18)
+        self.assertEqual(len(model.requests), 17)
 
 
 def rows(pairs):
     return tuple(Observation(0, "validation_parent", f"t{i}", "general",
                              str(round(p * 100)) if p is not None else "x", p, "a", c, "0" * 64)
                  for i, (p, c) in enumerate(pairs))
+
+
+class BatchingModel(FakeModel):
+    """FakeModel plus complete_batch(); records batch sizes and per-request receipts."""
+
+    def __init__(self, *args, fail_batch=False, truncate=(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.batches, self.fail_batch, self.truncate = [], fail_batch, truncate
+
+    def complete_batch(self, requests):
+        self.batches.append([r.purpose for r in requests])
+        if self.fail_batch:
+            raise RuntimeError("CUDA out of memory")
+        outcomes = []
+        for request in requests:
+            if task_id(request) in self.truncate and request.purpose == "answer":
+                self.requests.append(request)
+                outcomes.append(OutputTruncated("limit", "partial"))
+            else:
+                outcomes.append(self.complete(request))
+        self.last_receipts = [{"row": i} for i in range(len(requests))]
+        return outcomes
+
+
+def batch_plan():
+    def task(name):
+        return Task(name, f"Solve the distinct item {name}.", "ok")
+    return Plan((Round(tuple(task(f"d{i}") for i in range(3)), tuple(task(f"v{i}") for i in range(5))),),
+                tuple(task(f"f{i}") for i in range(4)))
+
+
+class BatchingTests(unittest.TestCase):
+    def test_independent_evaluation_calls_are_batched_but_journalled_one_by_one(self):
+        model = BatchingModel()
+        result, _, events, _ = run_case(model, batch_plan(), C(batch_size=4))
+        sizes = [len(b) for b in model.batches]
+        self.assertTrue(sizes and max(sizes) == 4)
+        self.assertTrue(all(len(set(b)) == 1 for b in model.batches))  # one purpose per batch
+        requests = [e for e in events if e["event"] == "llm_request"]
+        outcomes = [e for e in events if e["event"] in ("llm_response", "llm_truncated")]
+        self.assertEqual(len(requests), result.calls)
+        self.assertEqual(sorted(e["call"] for e in outcomes), list(range(1, result.calls + 1)))
+        batched = [e for e in events if e["event"] == "llm_response" and e["backend_receipt"]]
+        self.assertTrue(all("row" in e["backend_receipt"] for e in batched))
+        sequential = RecursiveMirror(FakeModel(), batch_plan(), C(batch_size=4)).run(INITIAL)
+        self.assertEqual(result.calls, sequential.calls)
+        self.assertEqual(result.committed_state, sequential.committed_state)
+
+    def test_batch_size_one_uses_the_sequential_path(self):
+        model = BatchingModel()
+        run_case(model, batch_plan(), C(batch_size=1))
+        self.assertEqual(model.batches, [])
+
+    def test_identical_requests_in_one_batch_are_answered_once_when_deterministic(self):
+        model = BatchingModel(deterministic=True)
+        engine = RecursiveMirror(model, batch_plan(), C())
+        request = Request("forecast", "s", render([("STRATEGY YOU WILL USE", "strategy-0")]), 4, 1)
+        replies = engine._call_many([request, request, replace(request, seed=2)])
+        self.assertEqual([r.call for r in replies], [1, 1, 2])
+        self.assertEqual(engine.calls, 2)
+        self.assertEqual(engine._call_many([request])[0].call, 1)
+        self.assertEqual(engine.cache_hits, 1)
+
+    def test_truncated_row_in_a_batch_is_scored_incorrect_without_aborting(self):
+        model = BatchingModel(truncate={"v1"})
+        result, _, events, _ = run_case(model, batch_plan(), C(batch_size=8))
+        rows = [o for o in result.committed_state.observations if o.task_id == "v1"]
+        self.assertTrue(rows and all(o.answer_status == "truncated" and not o.correct for o in rows))
+        self.assertTrue(any(e["event"] == "llm_truncated" for e in events))
+        self.assertEqual(events[-1]["event"], "run_completed")
+
+    def test_batch_failure_is_audited_and_aborts(self):
+        model, events = BatchingModel(fail_batch=True), []
+        with self.assertRaisesRegex(RuntimeError, "out of memory"):
+            RecursiveMirror(model, batch_plan(), C(batch_size=8), events.append).run(INITIAL)
+        error = next(e for e in events if e["event"] == "llm_error")
+        self.assertEqual(error["batch_calls"], [1, 2, 3])
+        self.assertEqual(events[-1]["event"], "run_failed")
+
+    def test_batch_never_exceeds_the_call_budget(self):
+        engine = RecursiveMirror(BatchingModel(), batch_plan(), C(max_calls=17))
+        engine.calls = 16
+        requests = [Request("forecast", "s", f"p{i}", 4, i) for i in range(2)]
+        with self.assertRaisesRegex(RuntimeError, "budget"):
+            engine._call_many(requests)
+        self.assertEqual(engine.calls, 16)
 
 
 class IsolationAndScoringTests(unittest.TestCase):
@@ -598,6 +730,12 @@ class IsolationAndScoringTests(unittest.TestCase):
             "answer: \\boxed{29842}": ("29842", "answer_line"),
             "Reasoning\nANSWER:\n42": ("42", "last_line"),
             "   \n\n": ("", "empty"),
+            "Step 3 done.\nANSWER: <41454>": ("41454", "answer_line"),
+            "So the result is $340$.\n\\[ \\boxed{340} \\]": ("340", "boxed"),
+            "Thus the final answer: Sunday": ("Sunday", "answer_line"),
+            "ANSWER: $13.6$": ("13.6", "answer_line"),
+            "ANSWER: \\(elbirroh\\)": ("elbirroh", "answer_line"),
+            "ANSWER: \\text{Tuesday}": ("Tuesday", "answer_line"),
         }
         for response, expected in cases.items():
             with self.subTest(response=response):
@@ -659,8 +797,10 @@ class IsolationAndScoringTests(unittest.TestCase):
             (parent, rows([(0.0, False), (0.0, False), (0.0, False), (0.0, False)]), False, "accuracy_regression"),
             # One malformed forecast cannot veto a real accuracy gain ...
             (parent, rows([(1.0, True), (1.0, True), (None, True), (1.0, True)]), True, "accuracy_gain"),
-            # ... but malformed forecasts count as the worst loss, so they cannot hide a collapse,
-            (parent, rows([(0.5, True), (0.5, True), (None, True), (None, False)]), False, "calibration_regression"),
+            # ... accuracy is primary, so a real accuracy gain passes even with degraded forecasts,
+            (parent, rows([(0.5, True), (0.5, True), (None, True), (None, False)]), True, "accuracy_gain"),
+            # but with accuracy unchanged, malformed forecasts count as the worst loss,
+            (parent, rows([(0.5, True), (0.5, False), (None, True), (None, False)]), False, "calibration_regression"),
             # and a calibration gain cannot come from dropping forecasts.
             (overconfident, rows([(1.0, True), (0.0, False), (None, True), (0.0, False)]), False,
              "forecast_coverage_regression"),

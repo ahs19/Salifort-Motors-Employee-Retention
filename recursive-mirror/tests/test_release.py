@@ -73,7 +73,7 @@ class ReleaseTests(unittest.TestCase):
         plan = load_plan(Path(__file__).resolve().parents[1] / "examples" / "headroom.json")
         engine = RecursiveMirror(type("M", (), {"identity": "budget-check"})(), plan, Config(max_depth=2, max_calls=240))
         needed = sum(engine._round_cost(r) for r in plan.rounds[:2]) + engine._final_reserve
-        self.assertEqual(needed, 220)
+        self.assertEqual(needed, 218)
 
     def test_interrupted_cell_preserves_child_log_and_refuses_overwrite(self):
         notebook = make_notebook(archive_bytes(source_payloads()))

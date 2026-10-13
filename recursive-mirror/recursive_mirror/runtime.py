@@ -7,7 +7,8 @@ import math
 import os
 from pathlib import Path
 import re
-from typing import Any
+import time
+from typing import Any, Callable
 
 from .core import (ANSWER_STATUSES, OUTCOMES, PHASES, Attempt, Config, LanguageModel, Observation,
                    OutputTruncated, Perspective, Plan, Request, RecursiveMirror, Result, Round, State,
@@ -329,13 +330,26 @@ class Journal:
 
 
 def execute(model: LanguageModel, plan: Plan, output: str | Path,
-            config: Config | None = None, initial: State | None = None) -> Result:
+            config: Config | None = None, initial: State | None = None,
+            on_event: Callable[[dict], None] | None = None) -> Result:
+    """Run one experiment into a new directory. on_event sees each event after it is journalled."""
     directory = Path(output)
     directory.mkdir(parents=True, exist_ok=False)
     journal = Journal(directory / "journal.jsonl")
+    started = time.monotonic()
+
+    def emit(event: dict) -> None:
+        # Wall-clock offsets are journal metadata only; results and checkpoints never include them.
+        journal({**event, "elapsed_seconds": round(time.monotonic() - started, 3)})
+        if on_event is not None:
+            try:
+                on_event(event)
+            except Exception:  # progress display must never alter the experiment
+                pass
+
     try:
         _save_exclusive(directory / "plan.json", asdict(plan))
-        engine = RecursiveMirror(model, plan, config, journal)
+        engine = RecursiveMirror(model, plan, config, emit)
         result = engine.run(initial)
         checkpoint = checkpoint_for(result)
         report = render_report(result)
@@ -359,20 +373,37 @@ class GenerationFailure(RuntimeError):
         self.partial_output = partial_output
 
 
-class HuggingFaceBackend:
-    """Greedy inference. Importing this module never imports or downloads models.
+DTYPES = ("auto", "float16", "bfloat16", "float32")
 
-    Greedy decoding is declared deterministic, so the engine reuses replies to
-    byte-identical requests within one run. Input above max_input_tokens is
-    refused, never truncated. Output that reaches max_new_tokens without EOS is
-    raised as OutputTruncated with its partial text: the engine records it and
-    scores it as unusable instead of aborting the whole experiment.
+
+def _dtype_keyword() -> str:
+    """transformers >= 4.56 renamed from_pretrained(torch_dtype=...) to dtype=..."""
+    try:
+        import transformers
+        major, minor = (int(part) for part in transformers.__version__.split(".")[:2])
+        return "dtype" if (major, minor) >= (4, 56) else "torch_dtype"
+    except Exception:
+        return "torch_dtype"
+
+
+class HuggingFaceBackend:
+    """Pure greedy inference. Importing this module never imports or downloads models.
+
+    Decoding is plain argmax: the model's shipped sampling settings and its
+    repetition penalty (Qwen2.5 ships 1.05, which transformers applies even when
+    do_sample=False) are overridden. It is declared deterministic, so the engine
+    reuses replies to byte-identical requests within one run. Input above
+    max_input_tokens is refused, never truncated. Output that reaches
+    max_new_tokens without EOS is raised as OutputTruncated with its partial
+    text: the engine records it and scores it as unusable instead of aborting.
+    dtype "auto" means float16 on CUDA (native on T4) and float32 on CPU.
     """
     deterministic = True
+    DTYPES = DTYPES
 
     def __init__(self, model: str, *, allow_download: bool = False,
                  device: str = "auto", four_bit: bool = False,
-                 revision: str | None = None, max_input_tokens: int = 8192):
+                 revision: str | None = None, max_input_tokens: int = 8192, dtype: str = "auto"):
         _string(model, "model")
         if revision is not None and (type(revision) is not str or not re.fullmatch(r"[0-9a-f]{40}", revision)):
             raise ValueError("revision must be a full 40-character lowercase hexadecimal commit")
@@ -384,15 +415,20 @@ class HuggingFaceBackend:
             raise ValueError("Four-bit inference requires CUDA")
         if type(max_input_tokens) is not int or not 256 <= max_input_tokens <= 131072:
             raise ValueError("max_input_tokens must be an integer in 256..131072")
+        if dtype not in self.DTYPES:
+            raise ValueError(f"dtype must be one of {self.DTYPES}")
+        if four_bit and dtype == "float32":
+            raise ValueError("Four-bit inference computes in float16 or bfloat16")
         self.model_name = model
         self.allow_download = allow_download
         self.device_request = device
         self.four_bit = four_bit
         self.revision = revision
         self.max_input_tokens = max_input_tokens
+        self.dtype = dtype
         self.identity = (f"huggingface:{model}|revision={revision or 'unresolved-local-or-cache'}"
-                         f"|device={device}|four_bit={str(four_bit).lower()}"
-                         f"|greedy|input_limit={max_input_tokens}|native_fp16_cuda")
+                         f"|device={device}|four_bit={str(four_bit).lower()}|dtype={dtype}"
+                         f"|pure_greedy|input_limit={max_input_tokens}")
         self.last_receipt: dict | None = None
         self._tokenizer = None
         self._model = None
@@ -419,14 +455,15 @@ class HuggingFaceBackend:
             raise GenerationFailure("Four-bit inference requires an available CUDA device")
         self._torch = torch
         self._device = "cuda:0" if use_cuda else "cpu"
-        # T4 has native FP16, not native BF16. Keep CUDA arithmetic FP16.
+        # T4 has native FP16, not native BF16, so "auto" keeps CUDA arithmetic FP16.
+        name = self.dtype if self.dtype != "auto" else ("float16" if use_cuda else "float32")
+        compute = getattr(torch, name)
         kwargs = {"local_files_only": not self.allow_download, "trust_remote_code": False,
-                  "revision": self.revision,
-                  "use_safetensors": True, "torch_dtype": torch.float16 if use_cuda else torch.float32}
+                  "revision": self.revision, "use_safetensors": True, _dtype_keyword(): compute}
         if self.four_bit:
             kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=torch.float16)
+                bnb_4bit_compute_dtype=compute)
             kwargs["device_map"] = {"": self._device}
         self._model = AutoModelForCausalLM.from_pretrained(self.model_name, **kwargs)
         if not self.four_bit:
@@ -442,16 +479,53 @@ class HuggingFaceBackend:
                 "actual_device": self._device,
                 "actual_dtype": str(self._model.dtype) if self._model is not None else None,
                 "weight_quantization": "nf4" if self.four_bit else None,
+                "decoding": "pure_greedy", "repetition_penalty": 1.0,
                 "input_truncated": False, "output_truncated": output_truncated,
                 "weight_bytes_verified": False}
+
+    def _render(self, request: Request) -> str:
+        return self._tokenizer.apply_chat_template(
+            [{"role": "system", "content": request.system}, {"role": "user", "content": request.prompt}],
+            tokenize=False, add_generation_prompt=True)
+
+    def _eos_ids(self) -> set:
+        eos = getattr(self._model.generation_config, "eos_token_id", None)
+        ids = set(eos if isinstance(eos, (tuple, list)) else [eos])
+        ids.add(self._tokenizer.eos_token_id)
+        ids.discard(None)
+        return ids
+
+    def _generate(self, input_ids, attention_mask, max_new_tokens: int, pad_token_id=None):
+        torch = self._torch
+        extra = {} if pad_token_id is None else {"pad_token_id": pad_token_id}
+        self._started = time.monotonic()
+        with torch.inference_mode():
+            # Override the checkpoint's sampling defaults so decoding is plain argmax.
+            return self._model.generate(input_ids=input_ids.to(self._device),
+                                        attention_mask=attention_mask.to(self._device),
+                                        max_new_tokens=max_new_tokens, do_sample=False, num_beams=1,
+                                        num_return_sequences=1, repetition_penalty=1.0, temperature=None,
+                                        top_p=None, top_k=None, use_cache=True,
+                                        return_dict_in_generate=False, **extra)
+
+    def _finish(self, tokens: list, input_tokens: int, limit: int):
+        """Cut one generated row at its first EOS; return (text or OutputTruncated, receipt)."""
+        eos_ids = self._eos_ids()
+        stop = next((i for i, token in enumerate(tokens) if token in eos_ids), None)
+        used = tokens if stop is None else tokens[:stop + 1]
+        truncated = stop is None and len(tokens) >= limit
+        text = self._tokenizer.decode(used, skip_special_tokens=True)
+        receipt = self._receipt(input_tokens, len(used), truncated)
+        receipt["generation_seconds"] = round(time.monotonic() - getattr(self, "_started", time.monotonic()), 3)
+        if truncated:
+            return OutputTruncated("Generation reached its token limit without EOS; partial output "
+                                   "kept for audit only.", text), receipt
+        return text, receipt
 
     def complete(self, request: Request) -> str:
         self.last_receipt = None
         self._load_tokenizer()
-        rendered = self._tokenizer.apply_chat_template(
-            [{"role": "system", "content": request.system}, {"role": "user", "content": request.prompt}],
-            tokenize=False, add_generation_prompt=True)
-        inputs = self._tokenizer(rendered, return_tensors="pt", add_special_tokens=False,
+        inputs = self._tokenizer(self._render(request), return_tensors="pt", add_special_tokens=False,
                                  truncation=False)
         length = inputs["input_ids"].shape[-1]
         self.last_receipt = self._receipt(length, 0)
@@ -460,21 +534,59 @@ class HuggingFaceBackend:
                                     f"{self.max_input_tokens}. No truncation applied.")
         self._load_model()
         self.last_receipt = self._receipt(length, 0)
+        self._torch.manual_seed(request.seed)
+        # Only what a causal LM consumes; some tokenizers also emit token_type_ids,
+        # which generate() rejects for Qwen2-family models.
+        mask = inputs["attention_mask"] if "attention_mask" in inputs else self._torch.ones_like(inputs["input_ids"])
+        generated = self._generate(inputs["input_ids"], mask, request.max_new_tokens)
+        outcome, self.last_receipt = self._finish(generated[0, length:].tolist(), length, request.max_new_tokens)
+        if isinstance(outcome, OutputTruncated):
+            raise outcome
+        return outcome
+
+    def complete_batch(self, requests: list[Request]) -> list:
+        """Left-padded batched greedy generation: one reply text or OutputTruncated per request.
+
+        Rows are cut at their own first EOS, so a row that finished early is not
+        affected by the others' continued generation. Hard failures (input
+        overflow, CUDA errors) raise for the whole batch. Padding can change
+        floating-point rounding slightly compared with unbatched decoding; the
+        result is still deterministic for the same batch.
+        """
+        self.last_receipts = None
+        limits = {request.max_new_tokens for request in requests}
+        if len(limits) != 1:
+            results, receipts = [], []
+            for request in requests:
+                try:
+                    results.append(self.complete(request))
+                except OutputTruncated as exc:
+                    results.append(exc)
+                receipts.append(self.last_receipt)
+            self.last_receipts = receipts
+            return results
+        limit = limits.pop()
+        self._load_tokenizer()
+        encoded = [self._tokenizer(self._render(r), add_special_tokens=False, truncation=False)["input_ids"]
+                   for r in requests]
+        lengths = [len(ids) for ids in encoded]
+        if max(lengths) > self.max_input_tokens:
+            self.last_receipts = [self._receipt(n, 0) for n in lengths]
+            raise GenerationFailure(f"A batched request contains {max(lengths)} input tokens; limit is "
+                                    f"{self.max_input_tokens}. No truncation applied.")
+        self._load_model()
         torch = self._torch
-        torch.manual_seed(request.seed)
-        inputs = {name: value.to(self._device) for name, value in inputs.items()}
-        with torch.inference_mode():
-            generated = self._model.generate(**inputs, max_new_tokens=request.max_new_tokens,
-                                             do_sample=False, num_beams=1, num_return_sequences=1,
-                                             use_cache=True, return_dict_in_generate=False)
-        tokens = generated[0, length:].tolist()
-        output = self._tokenizer.decode(tokens, skip_special_tokens=True)
-        eos = getattr(self._model.generation_config, "eos_token_id", None)
-        eos_ids = set(eos if isinstance(eos, (tuple, list)) else [eos])
-        eos_ids.add(self._tokenizer.eos_token_id)
-        truncated = len(tokens) >= request.max_new_tokens and (not tokens or tokens[-1] not in eos_ids)
-        self.last_receipt = self._receipt(length, len(tokens), truncated)
-        if truncated:
-            raise OutputTruncated("Generation reached its token limit without EOS; partial output "
-                                  "kept for audit only.", output)
-        return output
+        pad = self._tokenizer.pad_token_id
+        pad = pad if pad is not None else next(iter(sorted(self._eos_ids())))
+        width = max(lengths)
+        input_ids = torch.tensor([[pad] * (width - n) + ids for ids, n in zip(encoded, lengths)])
+        attention_mask = torch.tensor([[0] * (width - n) + [1] * n for n in lengths])
+        generated = self._generate(input_ids, attention_mask, limit, pad_token_id=pad)
+        results, receipts = [], []
+        for row, n in zip(generated[:, width:].tolist(), lengths):
+            outcome, receipt = self._finish(row, n, limit)
+            results.append(outcome)
+            receipts.append(receipt)
+        self.last_receipts = receipts
+        self.last_receipt = receipts[-1] if receipts else None
+        return results

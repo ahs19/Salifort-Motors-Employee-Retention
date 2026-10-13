@@ -8,7 +8,9 @@ import sys
 
 from .core import Config, RecursiveMirror, State, canonical
 from .demo import ScriptedTestDouble, demo_plan
-from .runtime import HuggingFaceBackend, _save_exclusive, execute, load_checkpoint, load_plan
+from .diagnostics import diagnose, diagnosis_markdown
+from .experiment import DEFAULT_CONTROL_STRATEGY, run_experiment, summary_markdown, write_summary
+from .runtime import DTYPES, HuggingFaceBackend, _save_exclusive, execute, load_checkpoint, load_plan
 from .tasks import CATEGORIES, generate_plan
 
 
@@ -44,12 +46,45 @@ def parser() -> argparse.ArgumentParser:
 
     run = commands.add_parser("run", help="Run a real local Hugging Face model on an explicit plan")
     run.add_argument("--plan", required=True)
+    experiment = commands.add_parser("experiment", help="Replicated runs over several generated plans, "
+                                     "with an optional hand-written control start, and a pooled summary")
+    experiment.add_argument("--seeds", type=_seeds, default=(2026, 2027, 2028))
+    experiment.add_argument("--rounds", type=int, default=3)
+    experiment.add_argument("--discovery", type=int, default=8)
+    experiment.add_argument("--validation", type=int, default=12)
+    experiment.add_argument("--final", type=int, default=24)
+    experiment.add_argument("--categories", type=_categories, default=CATEGORIES)
+    experiment.add_argument("--control-strategy", default=DEFAULT_CONTROL_STRATEGY,
+                            help="Hand-written starting strategy for the control arm ('' disables it)")
+    summary = commands.add_parser("summarize", help="Recompute the pooled summary of an experiment directory")
+    summary.add_argument("directory")
+    health = commands.add_parser("diagnose", help="Protocol health of one run directory (works on partial runs)")
+    health.add_argument("directory")
+    health.add_argument("--strict", action="store_true", help="Exit 1 if any warning is raised")
+    for sub in (run, experiment):
+        _model_options(sub)
+    return root
+
+
+def _seeds(text: str) -> tuple[int, ...]:
+    try:
+        seeds = tuple(int(part) for part in text.split(",") if part.strip())
+    except ValueError:
+        raise argparse.ArgumentTypeError("seeds must be comma-separated integers") from None
+    if not seeds or len(set(seeds)) != len(seeds) or min(seeds) < 0:
+        raise argparse.ArgumentTypeError("seeds must be distinct nonnegative integers")
+    return seeds
+
+
+def _model_options(run: argparse.ArgumentParser) -> None:
     run.add_argument("--output", required=True, help="New run directory; existing directories are refused")
     run.add_argument("--model", required=True)
     run.add_argument("--revision", help="Full 40-character commit; required for remote downloads")
     run.add_argument("--allow-download", action="store_true", help="Explicitly permit downloading model/tokenizer files")
     run.add_argument("--device", choices=("cuda", "cpu", "auto"), default="auto")
     run.add_argument("--four-bit", action="store_true", help="Use NF4 quantization on CUDA")
+    run.add_argument("--dtype", choices=DTYPES, default="auto",
+                     help="auto = float16 on CUDA (T4), float32 on CPU; bfloat16 suits L4/A100")
     run.add_argument("--max-input-tokens", type=int, default=8192,
                      help="Refuse (never truncate) longer prompts; v0.8 used 4096")
     run.add_argument("--max-depth", type=int, default=4)
@@ -67,7 +102,8 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--initial-strategy", help="Start from this strategy instead of the default "
                      "(for example a hand-written control prompt); not combinable with --state")
     run.add_argument("--initial-self-model", help="Start from this self-model; not combinable with --state")
-    return root
+    run.add_argument("--batch-size", type=int, default=Config.batch_size,
+                     help="Independent evaluation requests generated together on the GPU")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -80,18 +116,38 @@ def main(argv: list[str] | None = None) -> int:
             print(canonical({"plan": args.output, "rounds": len(plan.rounds),
                              "tasks": len(plan.tasks()), "categories": list(args.categories)}), flush=True)
             return 0
+        if args.command == "diagnose":
+            report = diagnose(args.directory)
+            print(diagnosis_markdown(args.directory, report), flush=True)
+            return 1 if args.strict and report["warnings"] else 0
+        if args.command == "summarize":
+            summary = write_summary(args.directory)
+            print(summary_markdown(summary), flush=True)
+            return 0
         if args.command == "demo":
             print("DEMO: deterministic scripted test double. Scores are software-test evidence only.", flush=True)
             model, plan, initial, config = ScriptedTestDouble(), demo_plan(), None, Config(max_depth=2, max_calls=200)
         else:
-            plan = load_plan(args.plan)
             config = Config(max_depth=args.max_depth, max_calls=args.max_calls, patience=args.patience,
                             candidate_kinds=args.candidates, answer_tokens=args.answer_tokens,
                             reveal_discovery_answers=not args.hide_discovery_answers, seed=args.seed,
-                            max_p_value=args.max_p_value)
+                            max_p_value=args.max_p_value, batch_size=args.batch_size)
             model = HuggingFaceBackend(args.model, allow_download=args.allow_download,
                                        device=args.device, four_bit=args.four_bit,
-                                       revision=args.revision, max_input_tokens=args.max_input_tokens)
+                                       revision=args.revision, max_input_tokens=args.max_input_tokens,
+                                       dtype=args.dtype)
+            if args.command == "experiment":
+                if args.state or args.initial_strategy or args.initial_self_model:
+                    raise ValueError("experiment starts every run fresh; use run for --state or --initial-*")
+                summary = run_experiment(model, args.output, seeds=args.seeds, config=config,
+                                         rounds=args.rounds, discovery=args.discovery,
+                                         validation=args.validation, final=args.final,
+                                         categories=args.categories,
+                                         control_strategy=args.control_strategy or None,
+                                         log=lambda line: print(line, flush=True))
+                completed = sum("final_n" in run for run in summary["runs"])
+                return 0 if completed == len(summary["runs"]) else 1
+            plan = load_plan(args.plan)
             custom = {key: value for key, value in (("strategy", args.initial_strategy),
                                                     ("self_model", args.initial_self_model)) if value is not None}
             if custom and args.state:

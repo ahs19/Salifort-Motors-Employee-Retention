@@ -40,13 +40,10 @@ class ScriptedTestDouble:
             return views[angle]
         if request.purpose.startswith("revise_strategy:"):
             return self.FIXED
-        if request.purpose.startswith("revise_self_model:"):
-            strategy = parts["STRATEGY THE AGENT WILL USE"]
-            if request.purpose.endswith(":recalibrate"):
-                if "order-of-operations" in strategy:
-                    return "Precedence tasks: reliable, about 99% with this strategy."
-                return "Precedence tasks: unreliable, about 10% with this strategy."
-            return "Precedence tasks: about 95% reliable when multiplying before adding. Other abilities untested."
+        if request.purpose == "revise_self_model:recalibrate":
+            if "order-of-operations" in parts["STRATEGY THE AGENT WILL KEEP"]:
+                return "Precedence tasks: reliable, about 99% with this strategy."
+            return "Precedence tasks: unreliable, about 10% with this strategy."
         raise ValueError(f"Unsupported scripted purpose: {request.purpose}")
 
 

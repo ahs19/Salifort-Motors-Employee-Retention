@@ -49,10 +49,11 @@ class RuntimeTests(unittest.TestCase):
         output = self.root / "demo"
         result = execute(ScriptedTestDouble(), demo_plan(), output, Config(max_depth=2, max_calls=200))
         self.assertTrue(result.transfer_improved)
-        self.assertEqual([s.accepted for s in result.steps], [True, False])
-        self.assertEqual([s.selected_kind for s in result.steps], ["repair", None])
+        # Level 0 repairs the strategy; level 1 recalibrates the self-model to the new strategy.
+        self.assertEqual([s.accepted for s in result.steps], [True, True])
+        self.assertEqual([s.selected_kind for s in result.steps], ["repair", "recalibrate"])
         self.assertEqual([[c.reason for c in s.candidates] for s in result.steps],
-                         [["accuracy_gain", "calibration_gain"], ["unchanged", "no_declared_gain"]])
+                         [["accuracy_gain", "calibration_gain"], ["unchanged", "calibration_gain"]])
         self.assertGreater(result.cache_hits, 0)
         self.assertEqual(result.model_identity, "scripted-test-double")
         self.assertEqual(load_checkpoint(output / "checkpoint.json"), result.committed_state)
@@ -249,9 +250,11 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(backend._tokenizer)
         self.assertIsNone(backend._model)
         self.assertTrue(backend.deterministic)
-        self.assertIn("|greedy|input_limit=8192|", backend.identity)
-        self.assertIn("|input_limit=4096|", HuggingFaceBackend("example/model", max_input_tokens=4096).identity)
-        for bad in ({"device": "cpu", "four_bit": True}, {"max_input_tokens": 100}, {"device": "tpu"}):
+        self.assertTrue(backend.identity.endswith("|dtype=auto|pure_greedy|input_limit=8192"))
+        self.assertIn("|input_limit=4096", HuggingFaceBackend("example/model", max_input_tokens=4096).identity)
+        self.assertIn("|dtype=bfloat16|", HuggingFaceBackend("example/model", dtype="bfloat16").identity)
+        for bad in ({"device": "cpu", "four_bit": True}, {"max_input_tokens": 100}, {"device": "tpu"},
+                    {"dtype": "int8"}, {"device": "cuda", "four_bit": True, "dtype": "float32"}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 HuggingFaceBackend("example/model", **bad)
 
@@ -290,7 +293,7 @@ class RuntimeTests(unittest.TestCase):
         input_tensor.shape = (1, input_length)
         input_tensor.to.return_value = input_tensor
         backend._tokenizer = Mock()
-        backend._tokenizer.return_value = {"input_ids": input_tensor}
+        backend._tokenizer.return_value = {"input_ids": input_tensor, "token_type_ids": input_tensor}
         backend._tokenizer.decode.return_value = "preserved partial text"
         backend._tokenizer.eos_token_id = eos
         generated = Mock()
@@ -325,11 +328,17 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(backend.last_receipt["output_truncated"])
         backend = self.fake_backend(tokens=(10, 99))
         self.assertEqual(backend.complete(Request("answer", "system", "prompt", 2, 42)), "preserved partial text")
-        self.assertFalse(backend._model.generate.call_args.kwargs["do_sample"])
-        self.assertEqual(backend.last_receipt, {
+        decoding = backend._model.generate.call_args.kwargs
+        self.assertEqual((decoding["do_sample"], decoding["repetition_penalty"], decoding["num_beams"]), (False, 1.0, 1))
+        self.assertEqual(sorted(backend._model.generate.call_args.kwargs.keys() & {"input_ids", "token_type_ids"}),
+                         ["input_ids"])
+        receipt = dict(backend.last_receipt)
+        self.assertGreaterEqual(receipt.pop("generation_seconds"), 0)
+        self.assertEqual(receipt, {
             "input_tokens": 3, "output_tokens": 2, "requested_revision": None,
             "resolved_model_commit": "a" * 40, "actual_device": "cpu",
             "actual_dtype": "torch.float32", "weight_quantization": None,
+            "decoding": "pure_greedy", "repetition_penalty": 1.0,
             "input_truncated": False, "output_truncated": False, "weight_bytes_verified": False,
         })
 
@@ -343,11 +352,13 @@ class RuntimeTests(unittest.TestCase):
                 code = main(["run", "--plan", str(plan), "--output", str(self.root / "pinned"),
                              "--model", "example/model", "--revision", revision, "--allow-download",
                              "--candidates", "repair,rewrite", "--max-depth", "2", "--max-calls", "300",
-                             "--hide-discovery-answers", "--max-input-tokens", "4096", "--max-p-value", "0.3"])
+                             "--hide-discovery-answers", "--max-input-tokens", "4096", "--max-p-value", "0.3",
+                             "--dtype", "bfloat16"])
         self.assertEqual(code, 0)
         self.assertEqual(factory.call_args.kwargs["revision"], revision)
         self.assertTrue(factory.call_args.kwargs["allow_download"])
         self.assertEqual(factory.call_args.kwargs["max_input_tokens"], 4096)
+        self.assertEqual(factory.call_args.kwargs["dtype"], "bfloat16")
         config = run.call_args.args[3]
         self.assertEqual((config.candidate_kinds, config.max_depth, config.max_calls, config.reveal_discovery_answers,
                           config.max_p_value), (("repair", "rewrite"), 2, 300, False, 0.3))
