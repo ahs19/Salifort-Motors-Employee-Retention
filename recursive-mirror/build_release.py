@@ -22,7 +22,7 @@ def sha(data: bytes) -> str:
 def source_payloads(root: Path = ROOT) -> dict[str, bytes]:
     selected = [root / "pyproject.toml", root / "README.md", root / "build_release.py"]
     for folder, pattern in (("recursive_mirror", "*.py"), ("tests", "test_*.py"),
-                            ("examples", "*.json")):
+                            ("examples", "*.json"), ("docs", "*.md")):
         selected.extend(sorted((root / folder).glob(pattern)))
     if (root / "VALIDATION.md").is_file():
         selected.append(root / "VALIDATION.md")
@@ -35,7 +35,7 @@ def source_payloads(root: Path = ROOT) -> dict[str, bytes]:
         if name.endswith(".py"):
             compile(data, name, "exec")
         payloads[name] = data
-    manifest = {"format": "recursive-mirror-release-v1", "version": "0.8.0",
+    manifest = {"format": "recursive-mirror-release-v1", "version": "0.9.0",
                 "files": {name: {"bytes": len(data), "sha256": sha(data)}
                           for name, data in sorted(payloads.items())}}
     payloads["MANIFEST.json"] = (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode()
@@ -66,14 +66,17 @@ def make_notebook(archive: bytes) -> dict:
         cells.append({"cell_type": "code", "id": f"cell-{len(cells)}", "metadata": {}, "source": text.splitlines(True),
                       "outputs": [], "execution_count": None})
 
-    markdown("""# Digital Mirror v0.8: recursive core\n
+    markdown("""# Digital Mirror v0.9: recursive self-improvement\n
 This notebook contains the complete reviewed source archive. It creates a fresh
 folder, checks the archive, runs software tests, then offers a **bounded GPU LLM
-trial**. The scripted demo is not model evidence. Select a free GPU runtime for
-the model trial; no paid upgrade is required or performed by these cells.
+self-improvement trial**. The scripted demo is not model evidence. Select a free
+GPU runtime for the model trial; no paid upgrade is required or performed here.
 
 Run cells individually in order. Keep the output and export partial evidence
-even if the real-model trial fails. This small arithmetic canary cannot establish
+even if the real-model trial fails. The trial uses the shipped `headroom.json`
+plan (six exact-answer task types where small models have room to improve).
+A positive result shows measured improvement of an inference-time strategy and
+self-model on held-out tasks for this model and plan only; it does not establish
 general self-improvement or subjective awareness.
 """)
     encoded = base64.b64encode(archive).decode("ascii")
@@ -101,7 +104,7 @@ general self-improvement or subjective awareness.
         for name, meta in manifest["files"].items():
             assert len(data[name]) == meta["bytes"]
             assert hashlib.sha256(data[name]).hexdigest() == meta["sha256"], name
-        SESSION = Path("/content") / ("recursive_mirror_v080_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8])
+        SESSION = Path("/content") / ("recursive_mirror_v090_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8])
         SESSION.mkdir(exist_ok=False)
         PROJECT = SESSION / "project"
         PROJECT.mkdir()
@@ -143,7 +146,9 @@ general self-improvement or subjective awareness.
 This cell checks for a GPU before installing inference dependencies. If no GPU
 is available, stop here. Keep the unit-test results; do not silently run the model
 on a CPU or purchase compute. The next cell may download the pinned Qwen 3B
-checkpoint into Colab's cache and makes at most 40 calls (the normal plan uses 30).
+checkpoint into Colab's cache and makes at most 240 LLM calls (two recursive
+levels and the held-out final comparison need at most 220). Expect roughly
+30-60 minutes on a T4.
 """)
     code('''
         captured("gpu-status", ["nvidia-smi"], timeout=30)
@@ -161,16 +166,33 @@ checkpoint into Colab's cache and makes at most 40 calls (the normal plan uses 3
     ''')
     code('''
         os.environ.setdefault("HF_HOME", "/content/hf_cache")
-        REAL_OUTPUT = SESSION / "real_trial"
+        os.environ.setdefault("USE_TF", "0")  # transformers need not import TensorFlow
         MODEL = "Qwen/Qwen2.5-3B-Instruct"
         REVISION = "aa8e72537993ba99e69dfaafa59ed015b17504d1"
-        captured("real-model-trial", [sys.executable, "-B", "-m", "recursive_mirror", "run",
-                 "--plan", str(PROJECT / "examples" / "canary.json"), "--output", str(REAL_OUTPUT),
-                 "--model", MODEL, "--revision", REVISION, "--allow-download", "--device", "cuda", "--four-bit",
-                 "--max-depth", "2", "--max-calls", "40"], timeout=1800)
-        result = json.loads((REAL_OUTPUT / "result.json").read_text())
-        print(json.dumps({key: result[key] for key in ["status", "calls", "transfer_improved",
-                         "initial_final_metrics", "candidate_final_metrics", "claim"]}, indent=2))
+        def trial(label, output, *extra):
+            captured(label, [sys.executable, "-B", "-m", "recursive_mirror", "run",
+                     "--plan", str(PROJECT / "examples" / "headroom.json"), "--output", str(output),
+                     "--model", MODEL, "--revision", REVISION, "--allow-download", "--device", "cuda", "--four-bit",
+                     "--max-input-tokens", "8192", "--max-depth", "2", "--max-calls", "240", *extra], timeout=5400)
+            result = json.loads((output / "result.json").read_text())
+            print(json.dumps({key: result[key] for key in ["status", "calls", "cache_hits", "transfer_improved",
+                             "initial_final_metrics", "candidate_final_metrics", "claim"]}, indent=2))
+            print((output / "report.md").read_text(encoding="utf-8"))
+        REAL_OUTPUT = SESSION / "real_trial"
+        trial("real-model-trial", REAL_OUTPUT)
+    ''')
+    markdown("""## Optional control: start from a hand-written step-by-step strategy\n
+The trial above measures improvement over the default starting strategy. This
+optional cell repeats the same plan from a generic hand-written reasoning prompt.
+If the loop still finds a transferable improvement from that stronger start, the
+gain is not explained by "add step-by-step reasoning" alone. It needs a similar
+amount of GPU time; skip it if the session is short.
+""")
+    code('''
+        CONTROL_OUTPUT = SESSION / "control_trial"
+        trial("control-trial", CONTROL_OUTPUT, "--initial-strategy",
+              "Think step by step. Break the task into small steps, show each intermediate result, "
+              "and check the result before the final answer line.")
     ''')
     markdown("""## Export evidence, including a failed or interrupted trial\n
 Run this once while the VM still has its files. It packages this new session's
@@ -192,7 +214,7 @@ temporary runtime. It does not turn a failed test into a successful one.
     ''')
     return {"nbformat": 4, "nbformat_minor": 5, "cells": cells,
             "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
-                         "language_info": {"name": "python"}, "colab": {"name": "Digital_Mirror_Recursive_v0_8.ipynb"}}}
+                         "language_info": {"name": "python"}, "colab": {"name": "Digital_Mirror_Recursive_v0_9.ipynb"}}}
 
 
 def build(output: Path) -> dict:
@@ -202,12 +224,12 @@ def build(output: Path) -> dict:
     archive = archive_bytes(payloads)
     notebook = make_notebook(archive)
     output.mkdir(parents=True, exist_ok=False)
-    archive_path = output / "digital-mirror-recursive-v0.8.0.zip"
+    archive_path = output / "digital-mirror-recursive-v0.9.0.zip"
     archive_path.write_bytes(archive)
-    notebook_path = output / "Digital_Mirror_Recursive_v0_8.ipynb"
+    notebook_path = output / "Digital_Mirror_Recursive_v0_9.ipynb"
     notebook_path.write_text(json.dumps(notebook, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
-    receipt = {"source_zip": str(archive_path), "source_sha256": sha(archive),
-               "source_bytes": len(archive), "notebook": str(notebook_path),
+    receipt = {"source_zip": archive_path.name, "source_sha256": sha(archive),
+               "source_bytes": len(archive), "notebook": notebook_path.name,
                "notebook_sha256": sha(notebook_path.read_bytes()), "packaged_files": len(payloads)}
     (output / "BUILD_RECEIPT.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
     return receipt

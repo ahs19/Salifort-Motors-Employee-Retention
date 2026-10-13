@@ -1,14 +1,14 @@
 """Independent behavioural tests; no model weights or network are required."""
 from __future__ import annotations
 
-import inspect
-import json
-import unittest
 from dataclasses import replace
+import inspect
+import re
+import unittest
 
 from recursive_mirror.core import (
-    Config, Metrics, Observation, Plan, RecursiveMirror, Round, State, Task,
-    digest, improves, summarize,
+    Config, Metrics, Observation, OutputTruncated, Plan, RecursiveMirror, Round, State, Task,
+    compare, digest, extract_answer, normalize_answer, paired_p_value, parse_forecast, sections, summarize,
 )
 
 
@@ -23,6 +23,19 @@ def make_plan(rounds=3, final_count=1, expected="ok"):
     )
 
 
+def task_id(request):
+    match = re.search(r"Solve the distinct item (\S+)\.", sections(request.prompt).get("TASK", ""))
+    return match.group(1) if match else None
+
+
+def level(request):
+    return int(re.search(r"Recursive level (\d+)", sections(request.prompt)["FRAME"]).group(1))
+
+
+def strategy_of(parts):
+    return parts.get("STRATEGY", parts.get("STRATEGY YOU WILL USE"))
+
+
 class FakeModel:
     """Returns deterministic text and records only the public request boundary."""
 
@@ -33,17 +46,18 @@ class FakeModel:
         "whole_system": "Both descriptions can apply when their viewpoints differ.",
     }
 
-    def __init__(self, evaluation=None, override=None):
+    def __init__(self, evaluation=None, override=None, deterministic=False):
         self.requests = []
         self.live_recursion_depths = []
         self.evaluation = evaluation or self.improving_evaluation
         self.override = override
+        self.deterministic = deterministic
 
     @staticmethod
-    def improving_evaluation(request, data):
-        version = int(data["agent"]["strategy"].removeprefix("strategy-"))
+    def improving_evaluation(request, parts):
+        version = int(strategy_of(parts).removeprefix("strategy-"))
         if request.purpose == "answer":
-            return "ok"
+            return "Reasoning.\nANSWER: ok"
         return str([10, 50, 80, 100][min(version, 3)])
 
     def complete(self, request):
@@ -59,150 +73,153 @@ class FakeModel:
             response = self.override(request)
             if response is not None:
                 return response
+        parts = sections(request.prompt)
         if request.purpose in ("forecast", "answer"):
-            return self.evaluation(request, json.loads(request.prompt))
+            return self.evaluation(request, parts)
         if request.purpose.startswith("perspective:"):
             return self.views[request.purpose.split(":", 1)[1]]
-        if request.purpose == "revise_strategy":
-            return f"strategy-{json.loads(request.prompt)['frame']['round_index'] + 1}"
-        if request.purpose == "revise_self_model":
-            return f"self-model-{json.loads(request.prompt)['frame']['round_index'] + 1}"
+        if request.purpose.startswith("revise_strategy:"):
+            return f"strategy-{level(request) + 1}"
+        if request.purpose.startswith("revise_self_model:"):
+            return f"self-model-{level(request) + 1}-{request.purpose.split(':')[1]}"
         raise AssertionError(f"Unexpected model purpose: {request.purpose}")
 
 
 INITIAL = State("strategy-0", "self-model-0")
 
 
-class RecursiveExecutionTests(unittest.TestCase):
-    def run_case(self, model=None, plan=None, config=None):
-        model = model or FakeModel()
-        events = []
-        engine = RecursiveMirror(model, plan or make_plan(), config, events.append)
-        return engine.run(INITIAL), model, events, engine
+def C(**kwargs):
+    """Config for single-item mechanics tests: one task can never reach p <= 0.25,
+    so these tests switch the evidence bound off. EvidenceGateTests cover it."""
+    kwargs.setdefault("max_p_value", 1.0)
+    return Config(**kwargs)
 
+
+def run_case(model=None, plan=None, config=None, initial=INITIAL):
+    model = model or FakeModel()
+    events = []
+    engine = RecursiveMirror(model, plan or make_plan(), config or C(), events.append)
+    return engine.run(initial), model, events, engine
+
+
+class RecursiveExecutionTests(unittest.TestCase):
     def test_calls_are_genuinely_nested_and_updated_state_reaches_next_level(self):
-        result, model, events, _ = self.run_case()
-        discovery = [
-            (json.loads(req.prompt)["agent"]["strategy"], depth)
-            for req, depth in zip(model.requests, model.live_recursion_depths)
-            if req.purpose == "forecast"
-            and json.loads(req.prompt)["task"]["task_id"].startswith("discovery-")
-        ]
-        self.assertEqual(discovery, [
-            ("strategy-0", 1), ("strategy-1", 2), ("strategy-2", 3),
-        ])
+        result, model, events, _ = run_case()
+        discovery = [(strategy_of(sections(req.prompt)), depth)
+                     for req, depth in zip(model.requests, model.live_recursion_depths)
+                     if req.purpose == "forecast" and task_id(req).startswith("discovery-")]
+        self.assertEqual(discovery, [("strategy-0", 1), ("strategy-1", 2), ("strategy-2", 3)])
         nesting = [(e["event"], e["round_index"]) for e in events
                    if e["event"] in ("recursive_enter", "recursive_return")]
         self.assertEqual(nesting, [
-            ("recursive_enter", 0), ("recursive_enter", 1),
-            ("recursive_enter", 2), ("recursive_return", 2),
-            ("recursive_return", 1), ("recursive_return", 0),
+            ("recursive_enter", 0), ("recursive_enter", 1), ("recursive_enter", 2),
+            ("recursive_return", 2), ("recursive_return", 1), ("recursive_return", 0),
         ])
         self.assertEqual(result.status, "plan_exhausted")
-        self.assertEqual(result.calls, 37)
+        # Per level: 2 discovery + 3 views + 3 proposal calls + 2 parent + 2x2 candidates.
+        self.assertEqual(result.calls, 3 * 14 + 4)
+        self.assertEqual(result.cache_hits, 0)
         self.assertTrue(all(step.accepted for step in result.steps))
+        self.assertEqual([s.selected_kind for s in result.steps], ["repair"] * 3)
         self.assertTrue(result.transfer_improved)
         self.assertEqual(result.committed_state.strategy, "strategy-3")
         self.assertEqual(result.committed_state.version, 3)
         self.assertEqual(result.claim, "measured_agent_strategy_and_self_prediction_only")
 
     def test_depth_limit_bounds_nested_calls(self):
-        result, model, _, _ = self.run_case(
-            plan=make_plan(4), config=Config(max_depth=2),
-        )
+        result, model, _, _ = run_case(plan=make_plan(4), config=C(max_depth=2))
         self.assertEqual(result.status, "depth_limit")
         self.assertEqual(len(result.steps), 2)
         self.assertEqual(max(model.live_recursion_depths), 2)
 
     def test_plateau_stops_after_declared_number_of_rejections(self):
-        model = FakeModel(evaluation=lambda req, data: "ok" if req.purpose == "answer" else "50")
-        result, _, _, _ = self.run_case(
-            model, make_plan(5), Config(max_depth=5, patience=2),
-        )
+        model = FakeModel(evaluation=lambda req, parts: "ANSWER: ok" if req.purpose == "answer" else "50")
+        result, _, _, _ = run_case(model, make_plan(5), C(max_depth=5, patience=2))
         self.assertEqual(result.status, "no_measured_progress")
         self.assertEqual(len(result.steps), 2)
         self.assertFalse(any(step.accepted for step in result.steps))
         self.assertFalse(result.transfer_improved)
         self.assertEqual(result.committed_state.strategy, INITIAL.strategy)
 
-    def test_proposal_is_frozen_before_any_validation_request(self):
-        result, model, events, _ = self.run_case(plan=make_plan(1))
-        proposal_pos = next(i for i, e in enumerate(events) if e["event"] == "proposal")
-        validation_positions = [
-            i for i, e in enumerate(events)
-            if e["event"] == "llm_request"
-            and e["request"]["purpose"] in ("forecast", "answer")
-            and json.loads(e["request"]["prompt"])["task"]["task_id"] == "validation-0"
-        ]
-        self.assertEqual(len(validation_positions), 4)
-        self.assertTrue(all(i > proposal_pos for i in validation_positions))
-        proposal = events[proposal_pos]
-        self.assertEqual(proposal["state_sha256"], digest(proposal["state"]))
-        self.assertEqual(result.steps[0].proposed_state_sha256, proposal["state_sha256"])
+    def test_every_proposal_is_frozen_before_any_validation_request(self):
+        result, model, events, _ = run_case(plan=make_plan(1))
+        proposals = [i for i, e in enumerate(events) if e["event"] == "proposal"]
+        self.assertEqual(len(proposals), 2)
+        validation = [i for i, e in enumerate(events) if e["event"] == "llm_request"
+                      and e["request"]["purpose"] in ("forecast", "answer")
+                      and "validation-0" in e["request"]["prompt"]]
+        self.assertEqual(len(validation), 6)
+        self.assertLess(max(proposals), min(validation))
+        by_kind = {events[i]["kind"]: events[i] for i in proposals}
+        candidates = {c.kind: c for c in result.steps[0].candidates}
+        for kind, event in by_kind.items():
+            self.assertEqual(event["state_sha256"], candidates[kind].proposed_state_sha256)
+            self.assertEqual(event["policy_sha256"], digest({"strategy": event["strategy"],
+                                                             "self_model": event["self_model"]}))
         for request in model.requests:
-            if request.purpose.startswith("perspective:") or request.purpose.startswith("revise_"):
+            if request.purpose.startswith(("perspective:", "revise_")):
                 self.assertNotIn("validation-0", request.prompt)
                 self.assertNotIn("final-0", request.prompt)
 
-    def test_each_reflection_receives_its_discovery_questions_and_measured_answers_only(self):
-        secret = "PRIVATE_ANSWER_KEY_594891"
-        basic = make_plan(2, expected=secret)
-        plan = replace(basic, rounds=tuple(
-            replace(round_, discovery=round_.discovery + (
-                Task(f"extra-discovery-{index}", f"Additional discovery question {index}?", secret),
-            ))
-            for index, round_ in enumerate(basic.rounds)
-        ))
-        model = FakeModel(evaluation=lambda req, data: "50" if req.purpose == "forecast" else "observed guess")
-        _, _, events, _ = self.run_case(model, plan)
-        reflection_requests = [req for req in model.requests
-                               if req.purpose.startswith("perspective:")
-                               or req.purpose.startswith("revise_")]
-        self.assertEqual(len(reflection_requests), 10)
-        hidden_tasks = [task for round_ in plan.rounds for task in round_.validation]
-        hidden_tasks.extend(plan.final_tasks)
-        for request in reflection_requests:
-            evidence = json.loads(request.prompt)
-            index = evidence["frame"]["round_index"]
-            discovery = plan.rounds[index].discovery
-            self.assertEqual(evidence["discovery_tasks"], [
-                {"task_id": task.task_id, "prompt": task.prompt, "category": task.category}
-                for task in discovery
-            ])
-            measured = [{key: value for key, value in event.items() if key != "event"}
-                        for event in events if event["event"] == "observation"
-                        and event["phase"] == "discovery" and event["round_index"] == index]
-            self.assertEqual(evidence["measured_observations"], measured)
-            self.assertEqual([row["task_id"] for row in measured], [task.task_id for task in discovery])
-            self.assertTrue(all(row["answer"] == "observed guess" and not row["correct"]
-                                for row in measured))
-            self.assertNotIn(secret, request.prompt)
-            self.assertNotIn('"expected"', request.prompt)
-            for task in hidden_tasks:
-                self.assertNotIn(task.prompt, request.prompt)
-                self.assertNotIn(task.task_id, request.prompt)
+    def test_reference_answers_reach_reflection_only_for_missed_discovery_tasks(self):
+        def secret_plan():
+            def task(name):
+                return Task(name, f"Solve the distinct item {name}.", f"KEY_{name}_517")
+            return Plan(tuple(Round((task(f"discovery-{i}"),), (task(f"validation-{i}"),))
+                              for i in range(2)), (task("final-0"),))
+
+        guess = lambda req, parts: "50" if req.purpose == "forecast" else "ANSWER: observed guess"  # noqa: E731
+        for reveal in (True, False):
+            with self.subTest(reveal=reveal):
+                plan = secret_plan()
+                _, model, _, _ = run_case(FakeModel(guess), plan, C(reveal_discovery_answers=reveal))
+                hidden = [t for r in plan.rounds for t in r.validation] + list(plan.final_tasks)
+                for request in model.requests:
+                    text = request.system + request.prompt
+                    for task in hidden:
+                        self.assertNotIn(task.expected, text)
+                    if request.purpose in ("forecast", "answer"):
+                        self.assertNotIn("KEY_", text)
+                reflections = [r for r in model.requests if r.purpose.startswith(("perspective:", "revise_"))]
+                self.assertEqual(len(reflections), 12)
+                for request in reflections:
+                    key = plan.rounds[level(request)].discovery[0].expected
+                    self.assertEqual(f"Reference answer: {key}" in request.prompt, reveal)
+                    self.assertIn("Agent's final answer: observed guess", request.prompt)
+                    other = plan.rounds[1 - level(request)].discovery[0].expected
+                    self.assertNotIn(other, request.prompt)
+
+    def test_answer_requests_carry_strategy_but_never_the_self_model(self):
+        _, model, _, _ = run_case(plan=make_plan(1))
+        answers = [r for r in model.requests if r.purpose == "answer"]
+        forecasts = [r for r in model.requests if r.purpose == "forecast"]
+        self.assertTrue(answers and forecasts)
+        for request in answers:
+            parts = sections(request.prompt)
+            self.assertEqual(set(parts), {"STRATEGY", "TASK", "OUTPUT RULE"})
+            self.assertNotIn("self-model", request.prompt)
+            self.assertIn("ANSWER: <answer>", request.system)
+        for request in forecasts:
+            self.assertEqual(list(sections(request.prompt)),
+                             ["STRATEGY YOU WILL USE", "SELF-MODEL", "TASK", "QUESTION"])
 
     def test_same_validation_item_uses_paired_seeds(self):
-        _, model, _, _ = self.run_case(plan=make_plan(1))
+        _, model, _, _ = run_case(plan=make_plan(1))
         for purpose in ("forecast", "answer"):
-            requests = [req for req in model.requests if req.purpose == purpose
-                        and json.loads(req.prompt)["task"]["task_id"] == "validation-0"]
-            self.assertEqual(len(requests), 2)
-            self.assertEqual(requests[0].seed, requests[1].seed)
-            self.assertEqual(json.loads(requests[0].prompt)["task"],
-                             json.loads(requests[1].prompt)["task"])
-            self.assertNotEqual(json.loads(requests[0].prompt)["agent"],
-                                json.loads(requests[1].prompt)["agent"])
+            requests = [r for r in model.requests if r.purpose == purpose and task_id(r) == "validation-0"]
+            self.assertEqual(len(requests), 3)
+            self.assertEqual(len({r.seed for r in requests}), 1)
+            self.assertEqual(len({sections(r.prompt)["TASK"] for r in requests}), 1)
 
     def test_final_heldout_failure_rolls_back_only_the_policy(self):
-        def evaluation(req, data):
-            candidate = data["agent"]["strategy"] != INITIAL.strategy
-            final = data["task"]["task_id"].startswith("final-")
+        def evaluation(req, parts):
+            candidate = strategy_of(parts) != INITIAL.strategy
+            final = task_id(req).startswith("final-")
             if req.purpose == "forecast":
                 return "100"
-            return "ok" if candidate != final else "incorrect"
+            return "ANSWER: ok" if candidate != final else "ANSWER: incorrect"
 
-        result, _, events, _ = self.run_case(FakeModel(evaluation), make_plan(1))
+        result, _, events, _ = run_case(FakeModel(evaluation), make_plan(1))
         self.assertTrue(result.steps[0].accepted)
         self.assertFalse(result.transfer_improved)
         self.assertEqual(result.candidate_state.strategy, "strategy-1")
@@ -210,35 +227,97 @@ class RecursiveExecutionTests(unittest.TestCase):
         self.assertEqual(result.committed_state.self_model, INITIAL.self_model)
         self.assertEqual(result.committed_state.version, INITIAL.version)
         self.assertEqual(len(result.committed_state.perspectives), 3)
-        self.assertEqual(len(result.committed_state.observations), 5)
+        self.assertEqual(len(result.committed_state.observations), 1 + 3 + 2)
         self.assertEqual(result.initial_final_metrics.accuracy, 1.0)
         self.assertEqual(result.candidate_final_metrics.accuracy, 0.0)
+        final = result.committed_state.attempts[-1]
+        self.assertEqual((final.kind, final.round_index, final.outcome, final.reason),
+                         ("final_transfer", -1, "rejected", "accuracy_regression"))
+        self.assertEqual(final.strategy, "strategy-1")
         self.assertEqual(events[-1]["event"], "run_completed")
 
-    def test_rejected_revision_retains_all_opposing_perspectives(self):
-        model = FakeModel(evaluation=lambda req, data: "ok" if req.purpose == "answer" else "50")
-        result, _, _, _ = self.run_case(model, make_plan(2))
+    def test_rejected_revisions_retain_perspectives_and_attempts(self):
+        model = FakeModel(evaluation=lambda req, parts: "ANSWER: ok" if req.purpose == "answer" else "50")
+        result, _, _, _ = run_case(model, make_plan(2))
         self.assertTrue(all(not step.accepted for step in result.steps))
         self.assertEqual(result.candidate_state.version, 0)
         self.assertEqual(result.candidate_state.strategy, INITIAL.strategy)
-        self.assertEqual(len(result.committed_state.perspectives), 6)
-        self.assertEqual([p.text for p in result.committed_state.perspectives],
-                         list(FakeModel.views.values()) * 2)
-        self.assertEqual([p.round_index for p in result.committed_state.perspectives],
-                         [0, 0, 0, 1, 1, 1])
-        self.assertEqual(len(result.committed_state.observations), 8)
+        state = result.committed_state
+        self.assertEqual([p.text for p in state.perspectives], list(FakeModel.views.values()) * 2)
+        self.assertEqual([p.round_index for p in state.perspectives], [0, 0, 0, 1, 1, 1])
+        self.assertEqual(len(state.observations), 2 * (1 + 3) + 2)
+        self.assertEqual([(a.round_index, a.kind, a.outcome, a.reason) for a in state.attempts], [
+            (0, "repair", "rejected", "no_declared_gain"), (0, "recalibrate", "rejected", "no_declared_gain"),
+            (1, "repair", "rejected", "no_declared_gain"), (1, "recalibrate", "rejected", "no_declared_gain"),
+        ])
+        self.assertEqual(state.attempts[0].strategy, "strategy-1")
 
-    def test_later_reflection_receives_previous_angles_without_unbounded_repetition(self):
-        _, model, _, _ = self.run_case(plan=make_plan(3))
-        reflections = [req for req in model.requests if req.purpose == "perspective:actor"]
+    def test_later_reflection_sees_previous_attempts_and_views_once(self):
+        model = FakeModel(evaluation=lambda req, parts: "ANSWER: ok" if req.purpose == "answer" else "50")
+        run_case(model, make_plan(3), C(max_depth=3, patience=3))
+        reflections = [r for r in model.requests if r.purpose == "perspective:actor"]
         self.assertEqual(len(reflections), 3)
+        history = [sections(r.prompt)["PREVIOUS IMPROVEMENT ATTEMPTS"] for r in reflections]
+        self.assertEqual(history[0], "(none yet)")
+        self.assertIn("level 0 | repair | REJECTED (no_declared_gain)", history[1])
+        self.assertIn("strategy tried: strategy-1", history[1])
+        self.assertIn("strategy tried: strategy-2", history[2])
         for text in FakeModel.views.values():
             self.assertNotIn(text, reflections[0].prompt)
             self.assertEqual(reflections[1].prompt.count(text), 1)
             self.assertEqual(reflections[2].prompt.count(text), 1)
 
+    def test_whole_system_view_integrates_the_other_angles_of_its_level(self):
+        _, model, _, _ = run_case(plan=make_plan(1))
+        whole = next(r for r in model.requests if r.purpose == "perspective:whole_system")
+        other = sections(whole.prompt)["THIS LEVEL'S OTHER VIEWS"]
+        self.assertIn(FakeModel.views["actor"], other)
+        self.assertIn(FakeModel.views["reviewer"], other)
+
+    def test_best_passing_candidate_is_selected_and_others_recorded(self):
+        def evaluation(req, parts):
+            strategy = strategy_of(parts)
+            if req.purpose == "forecast":
+                return "50"
+            good = strategy == "rewrite-plan" or (strategy == "strategy-1" and task_id(req) != "v-b")
+            return "ANSWER: ok" if good else "ANSWER: no"
+
+        def override(req):
+            if req.purpose == "revise_strategy:rewrite":
+                return "rewrite-plan"
+            return None
+
+        plan = Plan((Round((Task("d", "Solve the distinct item d.", "ok"),),
+                           (Task("v-a", "Solve the distinct item v-a.", "ok"),
+                            Task("v-b", "Solve the distinct item v-b.", "ok"))),),
+                    (Task("f", "Solve the distinct item f.", "ok"),))
+        result, _, _, _ = run_case(FakeModel(evaluation, override), plan,
+                                   C(candidate_kinds=("repair", "rewrite")))
+        step = result.steps[0]
+        self.assertEqual(step.selected_kind, "rewrite")
+        self.assertEqual([(c.kind, c.comparison.candidate.accuracy) for c in step.candidates],
+                         [("repair", 0.5), ("rewrite", 1.0)])
+        self.assertEqual([(a.kind, a.outcome) for a in result.candidate_state.attempts[:2]],
+                         [("repair", "passed_not_selected"), ("rewrite", "accepted")])
+        self.assertEqual(result.candidate_state.strategy, "rewrite-plan")
+
+    def test_unchanged_proposal_is_ineligible_and_costs_no_validation_calls(self):
+        def override(req):
+            if req.purpose.startswith("revise_strategy:"):
+                return INITIAL.strategy
+            if req.purpose.startswith("revise_self_model:"):
+                return INITIAL.self_model
+            return None
+
+        result, model, _, _ = run_case(FakeModel(override=override), make_plan(1))
+        self.assertEqual([(c.kind, c.eligible, c.reason) for c in result.steps[0].candidates],
+                         [("repair", False, "unchanged"), ("recalibrate", False, "unchanged")])
+        validation = [r for r in model.requests if task_id(r) == "validation-0"]
+        self.assertEqual(len(validation), 2)
+        self.assertEqual(result.calls, 2 + 3 + 3 + 2 + 4)
+
     def test_instance_is_one_use_after_success(self):
-        _, model, events, engine = self.run_case(plan=make_plan(1))
+        _, model, events, engine = run_case(plan=make_plan(1))
         calls, event_count = len(model.requests), len(events)
         with self.assertRaisesRegex(RuntimeError, "only once"):
             engine.run(INITIAL)
@@ -246,52 +325,116 @@ class RecursiveExecutionTests(unittest.TestCase):
         self.assertEqual(len(events), event_count)
 
 
+class EvidenceRegressionTests(unittest.TestCase):
+    """Failure modes observed in the 9 October 2026 v0.8 Colab trials."""
+
+    def test_truncated_perspective_is_retained_and_run_continues(self):
+        # v0.8 trial 1 aborted at call 5 when the whole-system view hit 384 tokens.
+        def override(req):
+            if req.purpose == "perspective:whole_system":
+                raise OutputTruncated("token limit", "A long whole-system view that never")
+            return None
+
+        result, _, events, _ = run_case(FakeModel(override=override), make_plan(1))
+        view = result.committed_state.perspectives[-1]
+        self.assertEqual((view.angle, view.complete, view.text),
+                         ("whole_system", False, "A long whole-system view that never"))
+        self.assertTrue(any(e["event"] == "llm_truncated" for e in events))
+        self.assertEqual(events[-1]["event"], "run_completed")
+
+    def test_truncated_answer_is_scored_incorrect_without_aborting(self):
+        def override(req):
+            if req.purpose == "answer" and task_id(req) == "discovery-0":
+                raise OutputTruncated("token limit", "Step 1: ... ANSWER: ok and then more")
+            return None
+
+        result, _, events, _ = run_case(FakeModel(override=override), make_plan(1))
+        row = next(o for o in result.committed_state.observations if o.task_id == "discovery-0")
+        self.assertEqual((row.answer, row.answer_status, row.correct), ("", "truncated", False))
+        self.assertEqual(events[-1]["event"], "run_completed")
+
+    def test_unusable_or_overlong_proposals_are_ineligible(self):
+        cases = {
+            "truncated": (lambda req: (_ for _ in ()).throw(OutputTruncated("limit", "Propose expanding"))
+                          if req.purpose == "revise_strategy:repair" else None, "strategy_truncated"),
+            "empty": (lambda req: "   " if req.purpose == "revise_strategy:repair" else None, "strategy_empty"),
+            "long": (lambda req: "x" * 1501 if req.purpose == "revise_strategy:repair" else None,
+                     "strategy_too_long"),
+            "self_model": (lambda req: "" if req.purpose == "revise_self_model:repair" else None,
+                           "self_model_empty"),
+        }
+        for name, (override, reason) in cases.items():
+            with self.subTest(name=name):
+                result, _, _, _ = run_case(FakeModel(override=override), make_plan(1))
+                repair = result.steps[0].candidates[0]
+                self.assertEqual((repair.kind, repair.eligible, repair.reason), ("repair", False, reason))
+                attempt = result.committed_state.attempts[0]
+                self.assertEqual((attempt.outcome, attempt.reason), ("ineligible", reason))
+
+    def test_parent_forecast_failure_cannot_create_candidate_calibration_gain(self):
+        # v0.8 trial 2, level 1: the parent echoed "216" instead of a probability,
+        # scored Brier 1.0, and an otherwise identical candidate was "accepted".
+        def evaluation(req, parts):
+            if req.purpose == "answer":
+                return "ANSWER: ok"
+            parent = strategy_of(parts) == INITIAL.strategy
+            return "216" if parent and task_id(req).startswith("validation") else "100"
+
+        result, _, _, _ = run_case(FakeModel(evaluation), make_plan(1))
+        comparison = result.steps[0].candidates[0].comparison
+        self.assertEqual(comparison.parent.forecast_coverage, 0.0)
+        self.assertEqual(comparison.parent.brier, 1.0)
+        self.assertEqual(comparison.candidate.brier, 0.0)
+        self.assertEqual(comparison.paired_n, 0)
+        self.assertFalse(comparison.passed)
+        self.assertEqual(comparison.reason, "no_declared_gain")
+        self.assertFalse(result.steps[0].accepted)
+
+    def test_empty_and_oversize_responses_are_recorded_not_fatal(self):
+        def override(req):
+            if req.purpose == "forecast" and task_id(req) == "discovery-0":
+                return ""
+            if req.purpose == "answer" and task_id(req) == "discovery-0":
+                return "x" * 12001
+            return None
+
+        result, _, events, _ = run_case(FakeModel(override=override), make_plan(1))
+        row = next(o for o in result.committed_state.observations if o.task_id == "discovery-0")
+        self.assertEqual((row.forecast_raw, row.probability), ("", None))
+        self.assertEqual((row.answer, row.answer_status, row.correct), ("", "oversize", False))
+        raw = [e for e in events if e["event"] == "llm_response" and e["call"] == 2]
+        self.assertEqual(raw[0]["response"], "x" * 12001)
+        self.assertEqual(events[-1]["event"], "run_completed")
+
+
 class BudgetAndAuditTests(unittest.TestCase):
     def test_budget_must_cover_final_comparison(self):
         with self.assertRaisesRegex(ValueError, "reserved final"):
-            RecursiveMirror(FakeModel(), make_plan(final_count=2), Config(max_calls=7))
+            RecursiveMirror(FakeModel(), make_plan(final_count=2), C(max_calls=7))
 
     def test_final_comparison_is_preserved_when_no_round_fits(self):
         model, events = FakeModel(), []
-        result = RecursiveMirror(model, make_plan(), Config(max_calls=4), events.append).run(INITIAL)
+        result = RecursiveMirror(model, make_plan(), C(max_calls=4), events.append).run(INITIAL)
         self.assertEqual(result.status, "call_budget")
         self.assertEqual(result.calls, 4)
         self.assertEqual(result.steps, ())
-        self.assertEqual([req.purpose for req in model.requests],
-                         ["forecast", "answer", "forecast", "answer"])
+        self.assertEqual([req.purpose for req in model.requests], ["forecast", "answer", "forecast", "answer"])
         self.assertFalse(any(e["event"] == "recursive_enter" for e in events))
+        self.assertFalse(result.transfer_improved)
 
     def test_round_cannot_consume_final_reserve(self):
         model = FakeModel()
-        result = RecursiveMirror(model, make_plan(3), Config(max_calls=25)).run(INITIAL)
+        result = RecursiveMirror(model, make_plan(3), C(max_calls=14 + 4 + 13)).run(INITIAL)
         self.assertEqual(result.status, "call_budget")
         self.assertEqual(len(result.steps), 1)
-        self.assertEqual(result.calls, 15)
-        self.assertEqual([json.loads(req.prompt)["task"]["task_id"]
-                          for req in model.requests[-4:]], ["final-0"] * 4)
+        self.assertEqual(result.calls, 18)
+        self.assertEqual([task_id(req) for req in model.requests[-4:]], ["final-0"] * 4)
 
     def test_exact_budget_allows_complete_round_and_final_test(self):
-        result = RecursiveMirror(FakeModel(), make_plan(1), Config(max_calls=15)).run(INITIAL)
-        self.assertEqual(result.calls, 15)
+        result = RecursiveMirror(FakeModel(), make_plan(1), C(max_calls=18)).run(INITIAL)
+        self.assertEqual(result.calls, 18)
         self.assertEqual(result.status, "plan_exhausted")
         self.assertTrue(result.transfer_improved)
-
-    def test_invalid_raw_output_is_audited_before_failure(self):
-        for bad_response in ("", " " * 4, "x" * 12001):
-            with self.subTest(length=len(bad_response)):
-                model = FakeModel(override=lambda req: bad_response)
-                events = []
-                engine = RecursiveMirror(model, make_plan(1), emit=events.append)
-                with self.assertRaises(ValueError):
-                    engine.run(INITIAL)
-                responses = [e for e in events if e["event"] == "llm_response"]
-                self.assertEqual(responses[0]["response"], bad_response)
-                self.assertEqual(events[-1]["event"], "run_failed")
-                self.assertEqual(events[-1]["calls"], 1)
-                self.assertFalse(any(e["event"] == "run_completed" for e in events))
-                with self.assertRaisesRegex(RuntimeError, "only once"):
-                    engine.run(INITIAL)
-                self.assertEqual(len(model.requests), 1)
 
     def test_backend_exception_aborts_with_failure_audit(self):
         def fail(request):
@@ -320,20 +463,27 @@ class BudgetAndAuditTests(unittest.TestCase):
         self.assertEqual(error["partial_output"], InterruptedReply.partial_output)
         self.assertFalse(any(e["event"] in ("observation", "selection", "run_completed") for e in events))
 
+    def test_non_text_response_aborts(self):
+        events = []
+        with self.assertRaises(TypeError):
+            RecursiveMirror(FakeModel(override=lambda req: 42), make_plan(1), emit=events.append).run(INITIAL)
+        self.assertEqual(events[-1]["event"], "run_failed")
+
     def test_backend_receipt_is_saved_alongside_each_raw_response(self):
         model = FakeModel()
         receipt = {"input_tokens": 42, "output_tokens": 1, "finish_reason": "eos"}
         model.last_receipt = receipt
         events = []
-        RecursiveMirror(model, make_plan(1), Config(max_calls=4), events.append).run(INITIAL)
+        RecursiveMirror(model, make_plan(1), C(max_calls=4), events.append).run(INITIAL)
         responses = [event for event in events if event["event"] == "llm_response"]
         self.assertEqual(len(responses), 4)
         self.assertTrue(all(event["backend_receipt"] == receipt for event in responses))
-        self.assertEqual([event["response"] for event in responses], ["10", "ok", "10", "ok"])
+        self.assertEqual([event["response"] for event in responses],
+                         ["10", "Reasoning.\nANSWER: ok", "10", "Reasoning.\nANSWER: ok"])
 
     def test_oversized_request_stops_before_backend_without_truncation(self):
         model, events = FakeModel(), []
-        engine = RecursiveMirror(model, make_plan(1), Config(max_request_chars=100), events.append)
+        engine = RecursiveMirror(model, make_plan(1), C(max_request_chars=100), events.append)
         with self.assertRaisesRegex(ValueError, "no truncation"):
             engine.run(INITIAL)
         self.assertEqual(model.requests, [])
@@ -341,17 +491,55 @@ class BudgetAndAuditTests(unittest.TestCase):
         self.assertEqual(events[-1]["calls"], 0)
 
 
+class DeterministicCacheTests(unittest.TestCase):
+    def test_deterministic_backend_reuses_identical_requests(self):
+        model = FakeModel(deterministic=True)
+        result, _, events, _ = run_case(model, make_plan(1))
+        # The recalibrate candidate keeps the parent's strategy, so its two answer
+        # requests per validation item are byte-identical to the parent's.
+        hits = [e for e in events if e["event"] == "llm_cache_hit"]
+        self.assertEqual([e["purpose"] for e in hits], ["answer"])
+        self.assertEqual(result.cache_hits, 1)
+        self.assertEqual(result.calls, 18 - 1)
+        self.assertEqual(len(model.requests), result.calls)
+        parent = next(o for o in result.committed_state.observations if o.phase == "validation_parent")
+        recal = next(o for o in result.committed_state.observations if o.arm == "recalibrate")
+        self.assertEqual(parent.answer, recal.answer)
+
+    def test_unchanged_policy_final_arm_is_free_for_deterministic_backends(self):
+        model = FakeModel(evaluation=lambda req, parts: "ANSWER: ok" if req.purpose == "answer" else "50",
+                          deterministic=True)
+        result, _, _, _ = run_case(model, make_plan(1, final_count=3))
+        self.assertFalse(result.steps[0].accepted)
+        self.assertEqual(result.initial_final_metrics, result.candidate_final_metrics)
+        self.assertFalse(result.transfer_improved)
+        finals = [r for r in model.requests if (task_id(r) or "").startswith("final-")]
+        self.assertEqual(len(finals), 6)
+
+    def test_nondeterministic_backend_never_uses_cache(self):
+        result, model, events, _ = run_case(FakeModel(deterministic=False), make_plan(1))
+        self.assertEqual(result.cache_hits, 0)
+        self.assertFalse(any(e["event"] == "llm_cache_hit" for e in events))
+        self.assertEqual(len(model.requests), 18)
+
+
+def rows(pairs):
+    return tuple(Observation(0, "validation_parent", f"t{i}", "general",
+                             str(round(p * 100)) if p is not None else "x", p, "a", c, "0" * 64)
+                 for i, (p, c) in enumerate(pairs))
+
+
 class IsolationAndScoringTests(unittest.TestCase):
     def test_resuming_rejects_task_ids_already_present_in_history(self):
-        previous = RecursiveMirror(FakeModel(), make_plan(1), Config(max_calls=4)).run(INITIAL)
+        previous = RecursiveMirror(FakeModel(), make_plan(1), C(max_calls=4)).run(INITIAL)
         model = FakeModel()
         with self.assertRaises(ValueError):
-            RecursiveMirror(model, make_plan(1), Config(max_calls=4)).run(previous.committed_state)
+            RecursiveMirror(model, make_plan(1), C(max_calls=4)).run(previous.committed_state)
         self.assertEqual(model.requests, [])
 
     def test_resuming_rejects_same_normalized_prompt_under_new_id(self):
         old_plan = make_plan(1)
-        previous = RecursiveMirror(FakeModel(), old_plan, Config(max_calls=4)).run(INITIAL)
+        previous = RecursiveMirror(FakeModel(), old_plan, C(max_calls=4)).run(INITIAL)
         new_plan = Plan(
             (Round((Task("new-d", "New discovery item", "ok"),),
                    (Task("new-v", "New validation item", "ok"),)),),
@@ -359,25 +547,25 @@ class IsolationAndScoringTests(unittest.TestCase):
         )
         model = FakeModel()
         with self.assertRaises(ValueError):
-            RecursiveMirror(model, new_plan, Config(max_calls=4)).run(previous.committed_state)
+            RecursiveMirror(model, new_plan, C(max_calls=4)).run(previous.committed_state)
         self.assertEqual(model.requests, [])
 
     def test_resuming_requires_complete_prompt_fingerprints(self):
-        legacy = Observation(0, "discovery", "old-id", "general", "50", 0.5, "ok", True)
+        legacy = Observation(0, "discovery", "old-id", "general", "50", 0.5, "ok", True, "")
         state = replace(INITIAL, observations=(legacy,))
         model = FakeModel()
         with self.assertRaises(ValueError):
-            RecursiveMirror(model, make_plan(1), Config(max_calls=4)).run(state)
+            RecursiveMirror(model, make_plan(1), C(max_calls=4)).run(state)
         self.assertEqual(model.requests, [])
 
     def test_resuming_with_fresh_tasks_preserves_prior_history(self):
-        previous = RecursiveMirror(FakeModel(), make_plan(1), Config(max_calls=4)).run(INITIAL)
+        previous = RecursiveMirror(FakeModel(), make_plan(1), C(max_calls=4)).run(INITIAL)
         new_plan = Plan(
             (Round((Task("new-d", "New discovery item", "ok"),),
                    (Task("new-v", "New validation item", "ok"),)),),
             (Task("new-f", "New final item", "ok"),),
         )
-        result = RecursiveMirror(FakeModel(), new_plan, Config(max_calls=4)).run(previous.committed_state)
+        result = RecursiveMirror(FakeModel(), new_plan, C(max_calls=4)).run(previous.committed_state)
         self.assertEqual(len(result.committed_state.observations), 4)
         self.assertTrue(all(len(row.prompt_sha256) == 64 for row in result.committed_state.observations))
         self.assertEqual(result.committed_state.observations[:2], previous.committed_state.observations)
@@ -385,10 +573,8 @@ class IsolationAndScoringTests(unittest.TestCase):
     def test_plan_rejects_duplicate_ids_and_normalized_prompts(self):
         d = Task("discovery", "Distinct discovery prompt", "a")
         v = Task("validation", "Distinct validation prompt", "b")
-        for final in (
-            Task("discovery", "Different final prompt", "c"),
-            Task("final", "  DISTINCT   validation\n prompt  ", "c"),
-        ):
+        for final in (Task("discovery", "Different final prompt", "c"),
+                      Task("final", "  DISTINCT   validation\n prompt  ", "c")):
             with self.subTest(final=final):
                 with self.assertRaisesRegex(ValueError, "disjoint"):
                     Plan((Round((d,), (v,)),), (final,))
@@ -402,23 +588,45 @@ class IsolationAndScoringTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     Plan(rounds, final)
 
-    def test_evaluator_answer_keys_never_enter_requests(self):
-        expected = "HIDDEN_EVALUATOR_SECRET_726403"
-        model = FakeModel(evaluation=lambda req, data: "50" if req.purpose == "forecast" else "guess")
-        RecursiveMirror(model, make_plan(2, expected=expected)).run(INITIAL)
-        for req in model.requests:
-            self.assertNotIn(expected, req.prompt)
-            self.assertNotIn(expected, req.system)
-            self.assertNotIn('"expected"', req.prompt)
-            if req.purpose in ("forecast", "answer"):
-                self.assertEqual(set(json.loads(req.prompt)["task"]),
-                                 {"task_id", "prompt", "category"})
+    def test_answer_extraction_prefers_the_last_answer_line(self):
+        cases = {
+            "42": ("42", "last_line"),
+            "  OK\n": ("OK", "last_line"),
+            "Work: 6*7=42\nANSWER: 42": ("42", "answer_line"),
+            "ANSWER: 41\nWait, recheck.\nANSWER: 42\n": ("42", "answer_line"),
+            "**Final Answer:** 42.": ("42.", "answer_line"),
+            "answer: \\boxed{29842}": ("29842", "answer_line"),
+            "Reasoning\nANSWER:\n42": ("42", "last_line"),
+            "   \n\n": ("", "empty"),
+        }
+        for response, expected in cases.items():
+            with self.subTest(response=response):
+                self.assertEqual(extract_answer(response), expected)
 
-    def test_noninteger_forecasts_are_recorded_and_penalized(self):
-        for raw in ("NaN", "0.5", "101", "-1", "50%", "050", "50 because likely"):
+    def test_answer_normalization_is_deterministic_and_literal(self):
+        same = [("29,842", "29842"), ("  Tenalp ", "tenalp"), ("**9.9**", "9.9"), ("'Sunday'.", "sunday"),
+                ("`3`", "3"), ("New   York", "new york")]
+        for raw, expected in same:
             with self.subTest(raw=raw):
-                model = FakeModel(evaluation=lambda req, data: raw if req.purpose == "forecast" else "ok")
-                result = RecursiveMirror(model, make_plan(1), Config(max_calls=4)).run(INITIAL)
+                self.assertEqual(normalize_answer(raw), expected)
+        for left, right in [("nine", "9"), ("9.90", "9.9"), ("3,7", "37"), ("1,2345", "12345")]:
+            with self.subTest(left=left):
+                self.assertNotEqual(normalize_answer(left), normalize_answer(right))
+
+    def test_forecast_parsing_accepts_only_one_integer_percentage(self):
+        valid = {"85": 0.85, " 100\n": 1.0, "0": 0.0, "7%": 0.07, " 64 % ": 0.64}
+        for raw, probability in valid.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(parse_forecast(raw), probability)
+        for raw in ("216", "NaN", "0.5", "101", "-1", "050", "50 because likely", "", "85\n90"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(parse_forecast(raw))
+
+    def test_invalid_forecasts_are_recorded_and_penalized(self):
+        for raw in ("NaN", "0.5", "101", "-1", "050", "50 because likely"):
+            with self.subTest(raw=raw):
+                model = FakeModel(evaluation=lambda req, parts: raw if req.purpose == "forecast" else "ANSWER: ok")
+                result = RecursiveMirror(model, make_plan(1), C(max_calls=4)).run(INITIAL)
                 self.assertEqual(result.candidate_final_metrics.forecast_coverage, 0.0)
                 self.assertEqual(result.candidate_final_metrics.brier, 1.0)
                 self.assertFalse(result.transfer_improved)
@@ -426,42 +634,93 @@ class IsolationAndScoringTests(unittest.TestCase):
                     self.assertEqual(row.forecast_raw, raw)
                     self.assertIsNone(row.probability)
 
-    def test_invalid_candidate_forecast_blocks_selection_even_with_correct_answers(self):
-        def evaluation(req, data):
+    def test_invalid_candidate_forecasts_block_selection_even_with_correct_answers(self):
+        def evaluation(req, parts):
             if req.purpose == "answer":
-                return "ok"
-            return "50" if data["agent"]["strategy"] == INITIAL.strategy else "certain"
+                return "ANSWER: ok"
+            return "50" if strategy_of(parts) == INITIAL.strategy else "certain"
 
-        result = RecursiveMirror(FakeModel(evaluation), make_plan(1)).run(INITIAL)
+        result = RecursiveMirror(FakeModel(evaluation), make_plan(1), C(candidate_kinds=("repair",))).run(INITIAL)
         self.assertFalse(result.steps[0].accepted)
-        self.assertEqual(result.steps[0].candidate_metrics.accuracy, 1.0)
-        self.assertEqual(result.steps[0].candidate_metrics.forecast_coverage, 0.0)
+        comparison = result.steps[0].candidates[0].comparison
+        self.assertEqual((comparison.candidate.accuracy, comparison.candidate.forecast_coverage), (1.0, 0.0))
+        self.assertEqual(comparison.reason, "calibration_regression")
         self.assertEqual(result.committed_state.strategy, INITIAL.strategy)
 
-    def test_trimmed_integer_forecasts_and_normalized_answers_are_accepted(self):
-        model = FakeModel(evaluation=lambda req, data: " 100\n" if req.purpose == "forecast" else "  OK\n")
-        result = RecursiveMirror(model, make_plan(1), Config(max_calls=4)).run(INITIAL)
-        self.assertEqual(result.candidate_final_metrics, Metrics(1.0, 0.0, 1.0, 1))
-
-    def test_metric_rule_requires_gain_and_disallows_regressions(self):
-        parent = Metrics(0.5, 0.25, 1.0, 10)
-        cfg = Config(min_accuracy_gain=0.1, min_brier_gain=0.1)
+    def test_paired_gate_requires_gain_and_disallows_regressions(self):
+        cfg = C(min_accuracy_gain=0.1, min_brier_gain=0.05)
+        parent = rows([(0.5, True), (0.5, False), (0.5, True), (0.5, False)])
+        overconfident = rows([(0.0, True), (1.0, False), (0.0, True), (1.0, False)])
         cases = [
-            (Metrics(0.5, 0.25, 1.0, 10), False),
-            (Metrics(0.6, 0.25, 1.0, 10), True),
-            (Metrics(0.5, 0.15, 1.0, 10), True),
-            (Metrics(0.6, 0.26, 1.0, 10), False),
-            (Metrics(0.4, 0.0, 1.0, 10), False),
-            (Metrics(1.0, 0.0, 0.9, 10), False),
+            (parent, rows([(0.5, True), (0.5, False), (0.5, True), (0.5, False)]), False, "no_declared_gain"),
+            (parent, rows([(0.5, True), (0.5, True), (0.5, True), (0.5, False)]), True, "accuracy_gain"),
+            (parent, rows([(0.8, True), (0.2, False), (0.8, True), (0.2, False)]), True, "calibration_gain"),
+            (parent, rows([(0.5, True), (0.5, True), (0.9, False), (0.9, False)]), False, "calibration_regression"),
+            (parent, rows([(0.0, False), (0.0, False), (0.0, False), (0.0, False)]), False, "accuracy_regression"),
+            # One malformed forecast cannot veto a real accuracy gain ...
+            (parent, rows([(1.0, True), (1.0, True), (None, True), (1.0, True)]), True, "accuracy_gain"),
+            # ... but malformed forecasts count as the worst loss, so they cannot hide a collapse,
+            (parent, rows([(0.5, True), (0.5, True), (None, True), (None, False)]), False, "calibration_regression"),
+            # and a calibration gain cannot come from dropping forecasts.
+            (overconfident, rows([(1.0, True), (0.0, False), (None, True), (0.0, False)]), False,
+             "forecast_coverage_regression"),
+            (overconfident, rows([(1.0, True), (0.0, False), (1.0, True), (0.0, False)]), True, "calibration_gain"),
         ]
-        for candidate, expected in cases:
-            with self.subTest(candidate=candidate):
-                self.assertEqual(improves(parent, candidate, cfg), expected)
+        for base, candidate, passed, reason in cases:
+            with self.subTest(reason=reason, candidate=candidate):
+                result = compare(base, candidate, cfg)
+                self.assertEqual((result.passed, result.reason), (passed, reason))
+        with self.assertRaisesRegex(ValueError, "same tasks"):
+            compare(parent, parent[::-1], cfg)
+
+    def test_evidence_gate_needs_consistent_per_task_gains(self):
+        cfg = Config()  # max_p_value = 0.25
+        parent = rows([(0.5, False)] * 4 + [(0.5, True)] * 4)
+        lucky = rows([(0.5, True)] + [(0.5, False)] * 3 + [(0.5, True)] * 4)          # one net win
+        lucky_mixed = rows([(0.5, True)] * 3 + [(0.5, False)] + [(0.5, False)] + [(0.5, True)] * 3)
+        consistent = rows([(0.5, True)] * 3 + [(0.5, False)] + [(0.5, True)] * 4)     # three wins
+        for candidate, passed, reason, p in [
+            (lucky, False, "gain_not_consistent", 0.5),
+            (lucky_mixed, False, "gain_not_consistent", 5 / 16),
+            (consistent, True, "accuracy_gain", 0.125),
+        ]:
+            with self.subTest(reason=reason, p=p):
+                result = compare(parent, candidate, cfg)
+                self.assertEqual((result.passed, result.reason), (passed, reason))
+                self.assertAlmostEqual(result.accuracy_p, p)
+        # A uniform shift of forecasts toward the observed rate is a consistent calibration gain.
+        miscalibrated = rows([(0.9, False)] * 6 + [(0.9, True)] * 2)
+        recalibrated = rows([(0.3, False)] * 6 + [(0.3, True)] * 2)
+        result = compare(miscalibrated, recalibrated, cfg)
+        self.assertEqual((result.passed, result.reason, result.paired_n), (True, "calibration_gain", 8))
+        self.assertLessEqual(result.calibration_p, 0.25)
+        one_item = compare(miscalibrated[:1], recalibrated[:1], cfg)
+        self.assertEqual((one_item.passed, one_item.reason, one_item.calibration_p),
+                         (False, "gain_not_consistent", 0.5))
 
     def test_invalid_forecasts_are_not_excluded_from_average(self):
-        valid = Observation(0, "test", "a", "general", "100", 1.0, "ok", True)
+        valid = Observation(0, "discovery", "a", "general", "100", 1.0, "ok", True, "0" * 64)
         invalid = replace(valid, task_id="b", forecast_raw="uncertain", probability=None)
-        self.assertEqual(summarize((valid, invalid)), Metrics(1.0, 0.5, 0.5, 2))
+        self.assertEqual(summarize((valid, invalid)), Metrics(1.0, 0.5, 0.5, 2, 1.0))
+
+    def test_paired_p_value_is_exact_one_sided_and_deterministic(self):
+        self.assertEqual(paired_p_value([]), 1.0)
+        self.assertEqual(paired_p_value([0, 0.0]), 1.0)
+        self.assertEqual(paired_p_value([1, 1, 1]), 0.125)              # exact sign test
+        self.assertAlmostEqual(paired_p_value([1] * 5 + [-1]), 7 / 64)
+        self.assertEqual(paired_p_value([-1] * 4), 1.0)
+        self.assertEqual(paired_p_value([1] * 30 + [-1] * 10), paired_p_value([-1] * 10 + [1] * 30))
+        self.assertAlmostEqual(paired_p_value([0.6, 0.6, -0.1]), 2 / 8)   # magnitude matters
+        many = [0.3, -0.05, 0.2, 0.1] * 6
+        self.assertEqual(paired_p_value(many), paired_p_value(many))     # fixed-seed Monte Carlo
+        self.assertLess(paired_p_value(many), 0.01)
+
+    def test_config_rejects_unknown_or_duplicate_candidate_kinds(self):
+        for kinds in ((), ("repair", "repair"), ("mutate",), ["repair"]):
+            with self.subTest(kinds=kinds), self.assertRaises(ValueError):
+                Config(candidate_kinds=kinds)
+        with self.assertRaises(ValueError):
+            Config(reveal_discovery_answers=1)
 
 
 if __name__ == "__main__":

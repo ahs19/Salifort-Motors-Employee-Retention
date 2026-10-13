@@ -1,4 +1,4 @@
-"""Digital Mirror's recursive, evidence-tested agent core."""
+"""Digital Mirror: recursive, evidence-gated self-improvement of an LLM agent."""
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 

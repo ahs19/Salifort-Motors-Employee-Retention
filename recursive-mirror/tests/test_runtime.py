@@ -10,10 +10,26 @@ import unittest
 from unittest.mock import Mock, patch
 
 from recursive_mirror.cli import main
-from recursive_mirror.core import Config, Perspective, RecursiveMirror, Request, State, canonical, digest
+from recursive_mirror.core import (Attempt, Config, OutputTruncated, Perspective, RecursiveMirror, Request,
+                                   State, canonical, digest)
 from recursive_mirror.demo import ScriptedTestDouble, demo_plan
 from recursive_mirror.runtime import (GenerationFailure, HuggingFaceBackend, checkpoint_for,
                                      execute, load_checkpoint, load_plan, plan_from_dict, read_json)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+V08_CHECKPOINT = ROOT / "evidence" / "v0.8.0-colab-20261009" / "token768_followup" / "trial" / "checkpoint.json"
+
+
+def demo_result():
+    return RecursiveMirror(ScriptedTestDouble(), demo_plan(), Config(max_depth=2, max_calls=200)).run()
+
+
+def legacy_checkpoint(state_dict):
+    """A checkpoint in the exact v0.8 (format v1) layout."""
+    payload = {"format": "recursive-mirror-checkpoint-v1", "model_identity": "legacy-model",
+               "plan_sha256": "b" * 64, "state": state_dict, "state_sha256": digest(state_dict)}
+    return {**payload, "checkpoint_sha256": digest(payload)}
 
 
 class RuntimeTests(unittest.TestCase):
@@ -29,18 +45,28 @@ class RuntimeTests(unittest.TestCase):
         path.write_text(json.dumps(value), encoding="utf-8")
         return path
 
-    def test_demo_persists_recursive_events_and_committed_state(self):
+    def test_demo_persists_recursive_events_report_and_committed_state(self):
         output = self.root / "demo"
-        result = execute(ScriptedTestDouble(), demo_plan(), output, Config(max_depth=2, max_calls=64))
+        result = execute(ScriptedTestDouble(), demo_plan(), output, Config(max_depth=2, max_calls=200))
         self.assertTrue(result.transfer_improved)
         self.assertEqual([s.accepted for s in result.steps], [True, False])
+        self.assertEqual([s.selected_kind for s in result.steps], ["repair", None])
+        self.assertEqual([[c.reason for c in s.candidates] for s in result.steps],
+                         [["accuracy_gain", "calibration_gain"], ["unchanged", "no_declared_gain"]])
+        self.assertGreater(result.cache_hits, 0)
         self.assertEqual(result.model_identity, "scripted-test-double")
         self.assertEqual(load_checkpoint(output / "checkpoint.json"), result.committed_state)
         events = [json.loads(line) for line in (output / "journal.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual(sum(e["event"] == "recursive_enter" for e in events), 2)
         self.assertEqual(sum(e["event"] == "llm_response" for e in events), result.calls)
+        self.assertEqual(sum(e["event"] == "llm_cache_hit" for e in events), result.cache_hits)
         self.assertEqual(load_plan(output / "plan.json"), demo_plan())
         self.assertEqual(events[-1]["event"], "runtime_completed")
+        report = (output / "report.md").read_text(encoding="utf-8")
+        self.assertIn("beat the initial policy on the held-out final tasks", report)
+        self.assertIn("| repair | **selected** (`accuracy_gain`) | 0% -> 100%", report)
+        self.assertIn(ScriptedTestDouble.FIXED, report)
+        self.assertIn("Nothing here certifies awareness", report)
 
     def test_existing_output_is_not_overwritten(self):
         output = self.root / "exists"
@@ -53,16 +79,25 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(list(output.iterdir()), [marker])
 
     def test_checkpoint_rejects_tamper_and_type_confusion(self):
-        result = RecursiveMirror(ScriptedTestDouble(), demo_plan()).run()
-        original = checkpoint_for(result)
+        original = checkpoint_for(demo_result())
+        self.assertEqual(original["format"], "recursive-mirror-checkpoint-v2")
         mutations = [
             lambda obj: obj["state"].update(version=True),
             lambda obj: obj["state"]["observations"][0].update(correct="false"),
             lambda obj: obj["state"]["observations"][0].update(probability=True),
+            lambda obj: obj["state"]["observations"][0].update(probability=0.1),
+            lambda obj: obj["state"]["observations"][0].update(arm="repair"),
+            lambda obj: obj["state"]["observations"][0].update(answer_status="guessed"),
+            lambda obj: obj["state"]["observations"][0].update(answer="", correct=True),
             lambda obj: obj["state"]["perspectives"][0].update(round_index=False),
             lambda obj: obj["state"]["perspectives"][0].update(angle=[]),
-            lambda obj: obj["state"]["observations"][0].update(probability=0.1),
+            lambda obj: obj["state"]["perspectives"][0].update(text="", complete=True),
+            lambda obj: obj["state"]["attempts"][0].update(outcome="promoted"),
+            lambda obj: obj["state"]["attempts"][0].update(kind="final_transfer"),
+            lambda obj: obj["state"]["attempts"][0].update(candidate_accuracy=1.5),
+            lambda obj: obj["state"]["attempts"][0].update(extra="injected"),
             lambda obj: obj["state"].update(extra="injected"),
+            lambda obj: obj["state"].pop("attempts"),
         ]
         for mutate in mutations:
             with self.subTest(mutate=mutate):
@@ -77,15 +112,17 @@ class RuntimeTests(unittest.TestCase):
             load_checkpoint(self.write_json("tampered.json", original))
 
     def test_checkpoint_history_limits_match_on_save_and_load(self):
-        result = RecursiveMirror(ScriptedTestDouble(), demo_plan()).run()
+        result = demo_result()
         view = Perspective(0, "actor", "a" * 64, "Retained perspective")
-        for field, item in (("perspectives", view), ("observations", result.committed_state.observations[0])):
+        attempt = Attempt(0, "repair", "s", "m", "rejected", "no_declared_gain")
+        for field, item in (("perspectives", view), ("observations", result.committed_state.observations[0]),
+                            ("attempts", attempt)):
             with self.subTest(field=field):
-                state = State(perspectives=(), observations=())
+                state = State(perspectives=(), observations=(), attempts=())
                 at_limit = replace(result, committed_state=replace(state, **{field: (item,) * 2}))
                 beyond = replace(result, committed_state=replace(state, **{field: (item,) * 3}))
                 # Exercise the same shared cap at a small bound, preserving all
-                # entries. The production constant is 10,000 for either history.
+                # entries. The production constant is 10,000 for each history.
                 with patch("recursive_mirror.runtime.MAX_COLLECTION_ITEMS", 2):
                     checkpoint = checkpoint_for(at_limit)
                     self.assertEqual(load_checkpoint(self.write_json("at-limit.json", checkpoint)), at_limit.committed_state)
@@ -97,8 +134,7 @@ class RuntimeTests(unittest.TestCase):
                         load_checkpoint(self.write_json("too-many.json", unchecked))
 
     def test_checkpoint_utf8_byte_limit_includes_final_newline(self):
-        result = RecursiveMirror(ScriptedTestDouble(), demo_plan()).run()
-        result = replace(result, committed_state=State(strategy="Unicode strategy: \u03c0", perspectives=(), observations=()))
+        result = replace(demo_result(), committed_state=State(strategy="Unicode strategy: π"))
         checkpoint = checkpoint_for(result)
         encoded = (canonical(checkpoint) + "\n").encode("utf-8")
         path = self.root / "byte-limit.json"
@@ -112,8 +148,35 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "size limit"):
                 load_checkpoint(path)
 
+    def test_v1_checkpoints_upgrade_with_their_original_hashes(self):
+        state = {"strategy": "Old strategy", "self_model": "Old self-model", "version": 2,
+                 "perspectives": [{"round_index": 0, "angle": "actor", "state_sha256": "c" * 64, "text": "view"}],
+                 "observations": [{"round_index": 0, "phase": "discovery", "task_id": "old", "category": "a",
+                                   "forecast_raw": "216", "probability": None, "answer": "43",
+                                   "correct": True, "prompt_sha256": "d" * 64}]}
+        loaded = load_checkpoint(self.write_json("v1.json", legacy_checkpoint(state)))
+        self.assertEqual((loaded.strategy, loaded.version, loaded.attempts), ("Old strategy", 2, ()))
+        self.assertTrue(loaded.perspectives[0].complete)
+        self.assertEqual((loaded.observations[0].answer_status, loaded.observations[0].policy_sha256),
+                         ("legacy", ""))
+        tampered = legacy_checkpoint(state)
+        tampered["state"]["version"] = 3
+        tampered["checkpoint_sha256"] = digest({k: v for k, v in tampered.items() if k != "checkpoint_sha256"})
+        with self.assertRaisesRegex(ValueError, "state hash mismatch"):
+            load_checkpoint(self.write_json("v1-tampered.json", tampered))
+
+    @unittest.skipUnless(V08_CHECKPOINT.is_file(), "v0.8 Colab evidence not shipped with this archive")
+    def test_real_v08_colab_checkpoint_loads_and_can_be_continued(self):
+        state = load_checkpoint(V08_CHECKPOINT)
+        self.assertEqual(state.strategy, State().strategy)
+        self.assertEqual(len(state.perspectives), 6)
+        self.assertEqual(len(state.observations), 2 + 4 + 4)
+        self.assertEqual(state.attempts, ())
+        result = RecursiveMirror(ScriptedTestDouble(), demo_plan(), Config(max_depth=1, max_calls=200)).run(state)
+        self.assertEqual(result.committed_state.observations[:10], state.observations)
+
     def test_checkpoint_continuation_requires_same_model_identity(self):
-        result = RecursiveMirror(ScriptedTestDouble(), demo_plan()).run()
+        result = demo_result()
         path = self.write_json("checkpoint.json", checkpoint_for(result))
         self.assertEqual(load_checkpoint(path, expected_model_identity="scripted-test-double"), result.committed_state)
         with self.assertRaisesRegex(ValueError, "model identity"):
@@ -121,8 +184,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(load_checkpoint(path), result.committed_state)
 
     def test_cli_rejects_cross_model_state_before_loading_or_creating_output(self):
-        result = RecursiveMirror(ScriptedTestDouble(), demo_plan()).run()
-        checkpoint = self.write_json("checkpoint.json", checkpoint_for(result))
+        checkpoint = self.write_json("checkpoint.json", checkpoint_for(demo_result()))
         plan = self.write_json("plan.json", asdict(demo_plan()))
         output = self.root / "cross-model"
         backend = Mock(identity="different-model-or-revision")
@@ -136,21 +198,20 @@ class RuntimeTests(unittest.TestCase):
         backend.complete.assert_not_called()
 
     def test_unreloadable_result_is_not_published_as_completed(self):
-        result = RecursiveMirror(ScriptedTestDouble(), demo_plan()).run()
+        result = demo_result()
         output = self.root / "unreloadable"
         with patch("recursive_mirror.runtime.RecursiveMirror.run", return_value=result):
             with patch("recursive_mirror.runtime.MAX_JSON_BYTES", 1):
                 with self.assertRaisesRegex(ValueError, "reload limit"):
                     execute(ScriptedTestDouble(), demo_plan(), output)
-        self.assertFalse((output / "result.json").exists())
-        self.assertFalse((output / "checkpoint.json").exists())
+        for name in ("result.json", "checkpoint.json", "report.md"):
+            self.assertFalse((output / name).exists())
         events = [json.loads(x) for x in (output / "journal.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual(events[-1]["event"], "runtime_failed")
         self.assertFalse(any(e["event"] == "runtime_completed" for e in events))
 
     def test_plan_rejects_unknown_fields_and_overlap(self):
-        obj = asdict(demo_plan())
-        obj = json.loads(json.dumps(obj))
+        obj = json.loads(json.dumps(asdict(demo_plan())))
         obj["rounds"][0]["discovery"][0]["hidden_instruction"] = "ignore grading"
         with self.assertRaises(ValueError):
             plan_from_dict(obj)
@@ -166,29 +227,33 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 read_json(path)
 
-    def test_partial_response_survives_failed_run(self):
+    def test_hard_backend_failure_keeps_partial_response_and_publishes_nothing(self):
         class Broken:
             identity = "scripted-failure-test-double"
 
             def complete(self, request):
-                raise GenerationFailure("token limit", "partial reply")
+                raise GenerationFailure("input overflow", "partial reply")
 
         output = self.root / "failed"
         with self.assertRaises(GenerationFailure):
             execute(Broken(), demo_plan(), output)
-        self.assertFalse((output / "result.json").exists())
-        self.assertFalse((output / "checkpoint.json").exists())
+        for name in ("result.json", "checkpoint.json", "report.md"):
+            self.assertFalse((output / name).exists())
         events = [json.loads(x) for x in (output / "journal.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertTrue(any(e["event"] == "run_failed" for e in events))
         self.assertTrue(any(e["event"] == "llm_error" and e.get("partial_output") == "partial reply" for e in events))
 
-    def test_backend_is_lazy_and_offline_by_default(self):
+    def test_backend_is_lazy_offline_and_deterministic_by_default(self):
         backend = HuggingFaceBackend("example/model")
         self.assertFalse(backend.allow_download)
         self.assertIsNone(backend._tokenizer)
         self.assertIsNone(backend._model)
-        with self.assertRaises(ValueError):
-            HuggingFaceBackend("example/model", device="cpu", four_bit=True)
+        self.assertTrue(backend.deterministic)
+        self.assertIn("|greedy|input_limit=8192|", backend.identity)
+        self.assertIn("|input_limit=4096|", HuggingFaceBackend("example/model", max_input_tokens=4096).identity)
+        for bad in ({"device": "cpu", "four_bit": True}, {"max_input_tokens": 100}, {"device": "tpu"}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                HuggingFaceBackend("example/model", **bad)
 
     def test_remote_downloads_require_immutable_revision(self):
         for revision in (None, "main", "a" * 39, "A" * 40, True):
@@ -219,8 +284,8 @@ class RuntimeTests(unittest.TestCase):
                     self.assertEqual(loader.from_pretrained.call_args.kwargs["local_files_only"], not allow_download)
                     self.assertFalse(loader.from_pretrained.call_args.kwargs["trust_remote_code"])
 
-    def fake_backend(self, *, input_length=3, tokens=(10, 11), eos=99):
-        backend = HuggingFaceBackend("fake/model")
+    def fake_backend(self, *, input_length=3, tokens=(10, 11), eos=99, **kwargs):
+        backend = HuggingFaceBackend("fake/model", **kwargs)
         input_tensor = Mock()
         input_tensor.shape = (1, input_length)
         input_tensor.to.return_value = input_tensor
@@ -241,18 +306,21 @@ class RuntimeTests(unittest.TestCase):
         return backend
 
     def test_input_ceiling_refuses_generation_without_truncating(self):
-        backend = self.fake_backend(input_length=4097)
+        backend = self.fake_backend(input_length=8193)
         with self.assertRaisesRegex(GenerationFailure, "No truncation applied"):
             backend.complete(Request("answer", "system", "prompt", 2, 42))
         backend._model.generate.assert_not_called()
         self.assertFalse(backend._tokenizer.call_args.kwargs["truncation"])
-        self.assertEqual(backend.last_receipt["input_tokens"], 4097)
+        self.assertEqual(backend.last_receipt["input_tokens"], 8193)
         self.assertEqual(backend.last_receipt["output_tokens"], 0)
+        self.assertEqual(self.fake_backend(input_length=8192, tokens=(10, 99)).complete(
+            Request("answer", "system", "prompt", 2, 42)), "preserved partial text")
 
-    def test_token_limit_retains_partial_output_and_eos_is_accepted(self):
+    def test_token_limit_raises_truncation_with_partial_output_and_eos_is_accepted(self):
         backend = self.fake_backend(tokens=(10, 11))
-        with self.assertRaises(GenerationFailure) as caught:
+        with self.assertRaises(OutputTruncated) as caught:
             backend.complete(Request("answer", "system", "prompt", 2, 42))
+        self.assertNotIsInstance(caught.exception, GenerationFailure)
         self.assertEqual(caught.exception.partial_output, "preserved partial text")
         self.assertTrue(backend.last_receipt["output_truncated"])
         backend = self.fake_backend(tokens=(10, 99))
@@ -265,17 +333,43 @@ class RuntimeTests(unittest.TestCase):
             "input_truncated": False, "output_truncated": False, "weight_bytes_verified": False,
         })
 
-    def test_cli_passes_revision_to_backend(self):
+    def test_cli_passes_revision_and_experiment_options_to_backend_and_config(self):
         plan = self.write_json("plan.json", asdict(demo_plan()))
         revision = "aa8e72537993ba99e69dfaafa59ed015b17504d1"
         stdout = io.StringIO()
-        with patch("recursive_mirror.cli.HuggingFaceBackend", return_value=ScriptedTestDouble()) as factory:
+        with patch("recursive_mirror.cli.HuggingFaceBackend", return_value=ScriptedTestDouble()) as factory, \
+                patch("recursive_mirror.cli.execute", wraps=execute) as run:
             with redirect_stdout(stdout):
                 code = main(["run", "--plan", str(plan), "--output", str(self.root / "pinned"),
-                             "--model", "example/model", "--revision", revision, "--allow-download"])
+                             "--model", "example/model", "--revision", revision, "--allow-download",
+                             "--candidates", "repair,rewrite", "--max-depth", "2", "--max-calls", "300",
+                             "--hide-discovery-answers", "--max-input-tokens", "4096", "--max-p-value", "0.3"])
         self.assertEqual(code, 0)
         self.assertEqual(factory.call_args.kwargs["revision"], revision)
         self.assertTrue(factory.call_args.kwargs["allow_download"])
+        self.assertEqual(factory.call_args.kwargs["max_input_tokens"], 4096)
+        config = run.call_args.args[3]
+        self.assertEqual((config.candidate_kinds, config.max_depth, config.max_calls, config.reveal_discovery_answers,
+                          config.max_p_value), (("repair", "rewrite"), 2, 300, False, 0.3))
+        self.assertIsNone(run.call_args.args[4])
+        summary = json.loads(stdout.getvalue())
+        self.assertEqual(summary["accepted_levels"], 1)
+        self.assertTrue(summary["transfer_improved"])
+
+    def test_cli_initial_strategy_sets_a_control_start_and_excludes_state(self):
+        plan = self.write_json("plan.json", asdict(demo_plan()))
+        with patch("recursive_mirror.cli.HuggingFaceBackend", return_value=ScriptedTestDouble()), \
+                patch("recursive_mirror.cli.execute", wraps=execute) as run, redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["run", "--plan", str(plan), "--output", str(self.root / "control"),
+                                   "--model", "m", "--initial-strategy", "Think step by step."]), 0)
+        self.assertEqual(run.call_args.args[4], State(strategy="Think step by step."))
+        checkpoint = self.write_json("checkpoint.json", checkpoint_for(demo_result()))
+        with patch("recursive_mirror.cli.HuggingFaceBackend", return_value=ScriptedTestDouble()), \
+                redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(main(["run", "--plan", str(plan), "--output", str(self.root / "both"),
+                                   "--model", "m", "--initial-strategy", "x", "--state", str(checkpoint)]), 1)
+        self.assertIn("cannot be combined", stderr.getvalue())
+        self.assertFalse((self.root / "both").exists())
 
     def test_cli_demo_is_explicit_and_refuses_reuse(self):
         output = self.root / "cli-demo"
@@ -286,6 +380,21 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("software-test evidence only", stdout.getvalue())
         self.assertIn("scripted-test-double", stdout.getvalue())
         self.assertIn("FileExistsError", stderr.getvalue())
+
+    def test_cli_make_plan_writes_a_loadable_plan_and_refuses_overwrite(self):
+        target = self.root / "plan.json"
+        args = ["make-plan", "--output", str(target), "--seed", "5", "--rounds", "1", "--discovery", "2",
+                "--validation", "3", "--final", "4", "--categories", "weekday,letter_count"]
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(main(args), 0)
+            self.assertEqual(main(args), 1)
+        self.assertIn("FileExistsError", stderr.getvalue())
+        plan = load_plan(target)
+        self.assertEqual([len(plan.rounds[0].discovery), len(plan.rounds[0].validation), len(plan.final_tasks)],
+                         [2, 3, 4])
+        self.assertEqual({t.category for t in plan.tasks()}, {"weekday", "letter_count"})
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            main(["make-plan", "--output", str(self.root / "x.json"), "--categories", "poetry"])
 
 
 if __name__ == "__main__":

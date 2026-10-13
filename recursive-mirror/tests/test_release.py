@@ -55,13 +55,25 @@ class ReleaseTests(unittest.TestCase):
         notebook = make_notebook(archive_bytes(source_payloads()))
         sources = ["".join(c["source"]) for c in notebook["cells"] if c["cell_type"] == "code"]
         setup = next(s for s in sources if 'captured("gpu-status"' in s)
-        trial = next(s for s in sources if 'captured("real-model-trial"' in s)
+        trial = next(s for s in sources if 'trial("real-model-trial"' in s)
         self.assertLess(setup.index('captured("gpu-status"'), setup.index('"pip", "install"'))
         self.assertIn('"--device", "cuda"', trial)
-        self.assertIn('"--max-depth", "2", "--max-calls", "40"', trial)
+        self.assertIn('"--max-depth", "2", "--max-calls", "240"', trial)
         self.assertIn('"--revision", REVISION', trial)
         self.assertIn('aa8e72537993ba99e69dfaafa59ed015b17504d1', trial)
-        self.assertIn('timeout=1800', trial)
+        self.assertIn('"examples" / "headroom.json"', trial)
+        self.assertIn('timeout=5400', trial)
+        control = next(s for s in sources if 'trial("control-trial"' in s)
+        self.assertIn('"--initial-strategy"', control)
+        self.assertLess(sources.index(trial), sources.index(control))
+
+    def test_trial_budget_covers_the_shipped_plan(self):
+        from recursive_mirror.core import Config, RecursiveMirror
+        from recursive_mirror.runtime import load_plan
+        plan = load_plan(Path(__file__).resolve().parents[1] / "examples" / "headroom.json")
+        engine = RecursiveMirror(type("M", (), {"identity": "budget-check"})(), plan, Config(max_depth=2, max_calls=240))
+        needed = sum(engine._round_cost(r) for r in plan.rounds[:2]) + engine._final_reserve
+        self.assertEqual(needed, 220)
 
     def test_interrupted_cell_preserves_child_log_and_refuses_overwrite(self):
         notebook = make_notebook(archive_bytes(source_payloads()))

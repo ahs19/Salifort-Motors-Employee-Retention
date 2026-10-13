@@ -1,4 +1,4 @@
-"""Local persistence and an optional, lazily loaded Hugging Face backend."""
+"""Local persistence, run reports and an optional, lazily loaded Hugging Face backend."""
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -9,11 +9,13 @@ from pathlib import Path
 import re
 from typing import Any
 
-from .core import (Config, LanguageModel, Observation, Perspective, Plan, Request,
-                   RecursiveMirror, Result, Round, State, Task, canonical, digest)
+from .core import (ANSWER_STATUSES, OUTCOMES, PHASES, Attempt, Config, LanguageModel, Observation,
+                   OutputTruncated, Perspective, Plan, Request, RecursiveMirror, Result, Round, State,
+                   Task, canonical, digest, excerpt, parse_forecast)
 
 
-CHECKPOINT_FORMAT = "recursive-mirror-checkpoint-v1"
+CHECKPOINT_FORMAT = "recursive-mirror-checkpoint-v2"
+LEGACY_CHECKPOINT_FORMATS = ("recursive-mirror-checkpoint-v1",)
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_COLLECTION_ITEMS = 10000
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
@@ -48,15 +50,21 @@ def _keys(value: object, required: set[str], optional: set[str] | None = None) -
     return value
 
 
-def _string(value: object, label: str, limit: int = 12000) -> str:
-    if type(value) is not str or not value.strip() or len(value) > limit:
-        raise ValueError(f"{label} must be nonblank text of at most {limit} characters")
+def _string(value: object, label: str, limit: int = 12000, *, blank_ok: bool = False) -> str:
+    if type(value) is not str or len(value) > limit or (not blank_ok and not value.strip()):
+        raise ValueError(f"{label} must be {'text' if blank_ok else 'nonblank text'} of at most {limit} characters")
     return value
 
 
 def _integer(value: object, label: str, minimum: int = 0) -> int:
     if type(value) is not int or value < minimum:
         raise ValueError(f"{label} must be an integer >= {minimum}")
+    return value
+
+
+def _unit(value: object, label: str) -> float | None:
+    if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1):
+        raise ValueError(f"{label} must be null or a number in [0, 1]")
     return value
 
 
@@ -93,46 +101,89 @@ def load_plan(path: str | Path) -> Plan:
     return plan_from_dict(read_json(path))
 
 
-def state_from_dict(value: object) -> State:
-    obj = _keys(value, {"strategy", "self_model", "version", "perspectives", "observations"})
+_V1_OBSERVATION = {"round_index", "phase", "task_id", "category", "forecast_raw",
+                   "probability", "answer", "correct", "prompt_sha256"}
+_V2_OBSERVATION = _V1_OBSERVATION | {"policy_sha256", "arm", "answer_status"}
+_ATTEMPT = {"round_index", "kind", "strategy", "self_model", "outcome", "reason", "n",
+            "parent_accuracy", "candidate_accuracy", "parent_brier", "candidate_brier", "wins", "losses"}
+
+
+def _perspective(item: object, legacy: bool) -> Perspective:
+    required = {"round_index", "angle", "state_sha256", "text"}
+    row = dict(_keys(item, required if legacy else required | {"complete"}))
+    _integer(row["round_index"], "perspective round_index")
+    if type(row["angle"]) is not str or row["angle"] not in RecursiveMirror.ANGLES:
+        raise ValueError("Unknown perspective angle")
+    _sha(row["state_sha256"], "perspective state_sha256")
+    row.setdefault("complete", True)
+    if type(row["complete"]) is not bool:
+        raise ValueError("Perspective complete must be a boolean")
+    _string(row["text"], "perspective text", blank_ok=not row["complete"])
+    return Perspective(**row)
+
+
+def _observation(item: object, legacy: bool) -> Observation:
+    row = dict(_keys(item, _V1_OBSERVATION if legacy else _V2_OBSERVATION))
+    if legacy:
+        row.update(policy_sha256="", arm="", answer_status="legacy")
+    _integer(row["round_index"], "observation round_index", -1)
+    if type(row["phase"]) is not str or row["phase"] not in PHASES:
+        raise ValueError("Unknown observation phase")
+    if (row["round_index"] == -1) != row["phase"].startswith("final_"):
+        raise ValueError("Observation phase and round_index disagree")
+    for key in ("task_id", "category"):
+        _string(row[key], key)
+    _string(row["forecast_raw"], "forecast_raw", blank_ok=True)
+    _string(row["answer"], "answer", blank_ok=True)
+    _sha(row["prompt_sha256"], "observation prompt_sha256")
+    if row["policy_sha256"] != "":
+        _sha(row["policy_sha256"], "observation policy_sha256")
+    if type(row["arm"]) is not str or (row["arm"] not in RecursiveMirror.KINDS and
+                                       not (row["arm"] == "" and (legacy or row["phase"] != "validation_candidate"))):
+        raise ValueError("Observation arm disagrees with its phase")
+    if row["arm"] and row["phase"] != "validation_candidate":
+        raise ValueError("Only validation candidates carry an arm")
+    if type(row["answer_status"]) is not str or row["answer_status"] not in ANSWER_STATUSES:
+        raise ValueError("Unknown observation answer_status")
+    probability = _unit(row["probability"], "Observation probability")
+    # A recorded probability must be exactly what the raw forecast parses to.
+    if probability is not None and probability != parse_forecast(row["forecast_raw"]):
+        raise ValueError("Observation probability disagrees with its raw forecast")
+    if type(row["correct"]) is not bool or (row["correct"] and not row["answer"].strip()):
+        raise ValueError("Observation correct must be a boolean backed by an answer")
+    return Observation(**row)
+
+
+def _attempt(item: object) -> Attempt:
+    row = _keys(item, _ATTEMPT)
+    _integer(row["round_index"], "attempt round_index", -1)
+    kinds = (*RecursiveMirror.KINDS, "final_transfer")
+    if type(row["kind"]) is not str or row["kind"] not in kinds:
+        raise ValueError("Unknown attempt kind")
+    if (row["round_index"] == -1) != (row["kind"] == "final_transfer"):
+        raise ValueError("Attempt kind and round_index disagree")
+    if type(row["outcome"]) is not str or row["outcome"] not in OUTCOMES:
+        raise ValueError("Unknown attempt outcome")
+    _string(row["reason"], "attempt reason", 200)
+    _string(row["strategy"], "attempt strategy", blank_ok=True)
+    _string(row["self_model"], "attempt self_model", blank_ok=True)
+    for key in ("n", "wins", "losses"):
+        _integer(row[key], f"attempt {key}")
+    for key in ("parent_accuracy", "candidate_accuracy", "parent_brier", "candidate_brier"):
+        _unit(row[key], f"attempt {key}")
+    return Attempt(**row)
+
+
+def state_from_dict(value: object, *, legacy: bool = False) -> State:
+    base = {"strategy", "self_model", "version", "perspectives", "observations"}
+    obj = _keys(value, base if legacy else base | {"attempts"})
     _string(obj["strategy"], "strategy")
     _string(obj["self_model"], "self_model")
     _integer(obj["version"], "version")
-    perspectives = []
-    for item in _array(obj["perspectives"], "perspectives"):
-        row = _keys(item, {"round_index", "angle", "state_sha256", "text"})
-        _integer(row["round_index"], "perspective round_index")
-        if type(row["angle"]) is not str or row["angle"] not in RecursiveMirror.ANGLES:
-            raise ValueError("Unknown perspective angle")
-        _sha(row["state_sha256"], "perspective state_sha256")
-        _string(row["text"], "perspective text")
-        perspectives.append(Perspective(**row))
-    observations = []
-    phases = {"discovery", "validation_parent", "validation_candidate", "final_initial", "final_candidate"}
-    for item in _array(obj["observations"], "observations"):
-        row = _keys(item, {"round_index", "phase", "task_id", "category", "forecast_raw",
-                          "probability", "answer", "correct", "prompt_sha256"})
-        _integer(row["round_index"], "observation round_index", -1)
-        if type(row["phase"]) is not str or row["phase"] not in phases:
-            raise ValueError("Unknown observation phase")
-        if (row["round_index"] == -1) != row["phase"].startswith("final_"):
-            raise ValueError("Observation phase and round_index disagree")
-        for key in ("task_id", "category", "forecast_raw", "answer"):
-            _string(row[key], key)
-        _sha(row["prompt_sha256"], "observation prompt_sha256")
-        probability = row["probability"]
-        if probability is not None and (type(probability) not in (int, float)
-                                        or not math.isfinite(probability) or not 0 <= probability <= 1):
-            raise ValueError("Observation probability must be null or a number in [0, 1]")
-        raw = row["forecast_raw"].strip()
-        expected_probability = int(raw) / 100 if re.fullmatch(r"(?:100|[1-9]?\d)", raw) else None
-        if probability != expected_probability:
-            raise ValueError("Observation probability disagrees with its raw forecast")
-        if type(row["correct"]) is not bool:
-            raise ValueError("Observation correct must be a boolean")
-        observations.append(Observation(**row))
-    return State(obj["strategy"], obj["self_model"], obj["version"],
-                 tuple(perspectives), tuple(observations))
+    perspectives = tuple(_perspective(item, legacy) for item in _array(obj["perspectives"], "perspectives"))
+    observations = tuple(_observation(item, legacy) for item in _array(obj["observations"], "observations"))
+    attempts = () if legacy else tuple(_attempt(item) for item in _array(obj["attempts"], "attempts"))
+    return State(obj["strategy"], obj["self_model"], obj["version"], perspectives, observations, attempts)
 
 
 def checkpoint_for(result: Result) -> dict:
@@ -154,7 +205,7 @@ def checkpoint_for(result: Result) -> dict:
 def _checkpoint_state(value: object) -> State:
     obj = _keys(value, {"format", "model_identity", "plan_sha256", "state",
                         "state_sha256", "checkpoint_sha256"})
-    if obj["format"] != CHECKPOINT_FORMAT:
+    if obj["format"] != CHECKPOINT_FORMAT and obj["format"] not in LEGACY_CHECKPOINT_FORMATS:
         raise ValueError("Unsupported checkpoint format")
     _string(obj["model_identity"], "model_identity")
     for field in ("plan_sha256", "state_sha256", "checkpoint_sha256"):
@@ -162,6 +213,12 @@ def _checkpoint_state(value: object) -> State:
     payload = {key: value for key, value in obj.items() if key != "checkpoint_sha256"}
     if digest(payload) != obj["checkpoint_sha256"]:
         raise ValueError("Checkpoint content hash mismatch")
+    legacy = obj["format"] in LEGACY_CHECKPOINT_FORMATS
+    if legacy:
+        # Verify the v1 state hash on its original representation, then upgrade.
+        if digest(obj["state"]) != obj["state_sha256"]:
+            raise ValueError("Checkpoint state hash mismatch")
+        return state_from_dict(obj["state"], legacy=True)
     state = state_from_dict(obj["state"])
     if state.sha256 != obj["state_sha256"]:
         raise ValueError("Checkpoint state hash mismatch")
@@ -180,9 +237,81 @@ def load_checkpoint(path: str | Path, *, expected_model_identity: str | None = N
 
 def _save_exclusive(path: Path, value: object) -> None:
     with path.open("x", encoding="utf-8", newline="\n") as handle:
-        handle.write(canonical(value) + "\n")
+        handle.write(value if isinstance(value, str) else canonical(value) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def _pct(value: float | None) -> str:
+    return "n/a" if value is None else f"{100 * value:.0f}%"
+
+
+def _num(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.3f}"
+
+
+def render_report(result: Result) -> str:
+    """A human-readable summary of what the run measured. The journal stays authoritative."""
+    final = result.final_comparison
+    lines = ["# Recursive Mirror run report", "",
+             f"- Protocol: `{result.protocol}`",
+             f"- Model: `{result.model_identity}`",
+             f"- Stop reason: `{result.status}`; LLM calls: {result.calls} (plus {result.cache_hits} "
+             "deterministic cache hits)",
+             f"- Levels completed: {len(result.steps)}; accepted improvements: "
+             f"{sum(s.accepted for s in result.steps)}"]
+    if result.transfer_improved:
+        lines.append("- **Outcome: the self-improved policy beat the initial policy on the held-out final "
+                     "tasks and was committed.**")
+    elif any(s.accepted for s in result.steps):
+        lines.append("- **Outcome: a policy improved on validation but did not transfer to the held-out "
+                     "final tasks; the committed policy was rolled back to the initial one.**")
+    else:
+        lines.append("- **Outcome: no proposal passed validation; the initial policy remains committed.**")
+    lines += ["", f"## Final held-out comparison (n = {final.parent.n})", "",
+              "| policy | accuracy | Brier | forecast coverage | mean forecast |",
+              "|---|---|---|---|---|"]
+    for name, m in (("initial", final.parent), ("self-improved candidate", final.candidate)):
+        lines.append(f"| {name} | {_pct(m.accuracy)} | {_num(m.brier)} | {_pct(m.forecast_coverage)} | "
+                     f"{_pct(m.mean_forecast)} |")
+    lines += ["", f"Wins {final.wins}, losses {final.losses}. One-sided paired p-values: accuracy "
+              f"{final.accuracy_p:.3f}, calibration {final.calibration_p:.3f} (gate requires <= "
+              f"{result.config.max_p_value:g}; exploratory, not a confirmatory test). Gate: "
+              f"{'passed' if final.passed else 'failed'} (`{final.reason}`).", ""]
+    for step in result.steps:
+        d, p = step.discovery_metrics, step.parent_metrics
+        lines += [f"## Level {step.round_index}", "",
+                  f"Discovery: accuracy {_pct(d.accuracy)} on {d.n} tasks, mean forecast "
+                  f"{_pct(d.mean_forecast)}. Parent on validation: accuracy {_pct(p.accuracy)}, "
+                  f"Brier {_num(p.brier)} (n = {p.n}).", "",
+                  "| candidate | gate | accuracy | paired Brier | wins/losses | p (acc / cal) |",
+                  "|---|---|---|---|---|---|"]
+        for c in step.candidates:
+            if c.comparison is None:
+                lines.append(f"| {c.kind} | ineligible (`{c.reason}`) | | | | |")
+                continue
+            cmp = c.comparison
+            gate = ("**selected**" if step.selected_kind == c.kind else
+                    "passed" if cmp.passed else "rejected") + f" (`{cmp.reason}`)"
+            lines.append(f"| {c.kind} | {gate} | {_pct(cmp.parent.accuracy)} -> {_pct(cmp.candidate.accuracy)} | "
+                         f"{_num(cmp.parent_paired_brier)} -> {_num(cmp.candidate_paired_brier)} | "
+                         f"{cmp.wins}/{cmp.losses} | {cmp.accuracy_p:.2f} / {cmp.calibration_p:.2f} |")
+        for c in step.candidates:
+            if c.strategy.strip() or c.self_model.strip():
+                lines += ["", f"<details><summary>{c.kind} proposal</summary>", "",
+                          "Strategy:", "", "```text", excerpt(c.strategy, 3000) or "(none)", "```", "",
+                          "Self-model:", "", "```text", excerpt(c.self_model, 3000) or "(none)", "```",
+                          "", "</details>"]
+        lines.append("")
+    committed = result.committed_state
+    lines += ["## Committed policy", "", "Strategy:", "", "```text", committed.strategy, "```", "",
+              "Self-model:", "", "```text", committed.self_model, "```", "",
+              "## Claim boundary", "",
+              "This run measures whether an inference-time strategy and self-model, revised by the "
+              "model through recursive self-examination, improved exact-answer accuracy or forecast "
+              "calibration on held-out tasks. Model weights were not changed. Small task sets give "
+              "noisy estimates. Nothing here certifies awareness or consciousness.", ""]
+    return "\n".join(lines)
 
 
 class Journal:
@@ -209,8 +338,10 @@ def execute(model: LanguageModel, plan: Plan, output: str | Path,
         engine = RecursiveMirror(model, plan, config, journal)
         result = engine.run(initial)
         checkpoint = checkpoint_for(result)
+        report = render_report(result)
         _save_exclusive(directory / "result.json", asdict(result))
         _save_exclusive(directory / "checkpoint.json", checkpoint)
+        _save_exclusive(directory / "report.md", report)
         journal({"event": "runtime_completed", "state_sha256": result.committed_state.sha256,
                  "checkpoint_sha256": checkpoint["checkpoint_sha256"]})
         return result
@@ -222,6 +353,7 @@ def execute(model: LanguageModel, plan: Plan, output: str | Path,
 
 
 class GenerationFailure(RuntimeError):
+    """A hard backend failure (for example input overflow); it aborts the run."""
     def __init__(self, message: str, partial_output: str = ""):
         super().__init__(message)
         self.partial_output = partial_output
@@ -230,13 +362,17 @@ class GenerationFailure(RuntimeError):
 class HuggingFaceBackend:
     """Greedy inference. Importing this module never imports or downloads models.
 
-    A 4096-token ceiling is a conservative guard for the initial v0.8 Colab
-    canary, not a claim that larger requests are impossible. Partial generations
-    are rejected and made available to the engine's error journal.
+    Greedy decoding is declared deterministic, so the engine reuses replies to
+    byte-identical requests within one run. Input above max_input_tokens is
+    refused, never truncated. Output that reaches max_new_tokens without EOS is
+    raised as OutputTruncated with its partial text: the engine records it and
+    scores it as unusable instead of aborting the whole experiment.
     """
+    deterministic = True
+
     def __init__(self, model: str, *, allow_download: bool = False,
                  device: str = "auto", four_bit: bool = False,
-                 revision: str | None = None):
+                 revision: str | None = None, max_input_tokens: int = 8192):
         _string(model, "model")
         if revision is not None and (type(revision) is not str or not re.fullmatch(r"[0-9a-f]{40}", revision)):
             raise ValueError("revision must be a full 40-character lowercase hexadecimal commit")
@@ -246,14 +382,17 @@ class HuggingFaceBackend:
             raise ValueError("device must be auto, cuda or cpu")
         if four_bit and device == "cpu":
             raise ValueError("Four-bit inference requires CUDA")
+        if type(max_input_tokens) is not int or not 256 <= max_input_tokens <= 131072:
+            raise ValueError("max_input_tokens must be an integer in 256..131072")
         self.model_name = model
         self.allow_download = allow_download
         self.device_request = device
         self.four_bit = four_bit
         self.revision = revision
+        self.max_input_tokens = max_input_tokens
         self.identity = (f"huggingface:{model}|revision={revision or 'unresolved-local-or-cache'}"
                          f"|device={device}|four_bit={str(four_bit).lower()}"
-                         "|greedy|input_limit=4096|native_fp16_cuda")
+                         f"|greedy|input_limit={max_input_tokens}|native_fp16_cuda")
         self.last_receipt: dict | None = None
         self._tokenizer = None
         self._model = None
@@ -316,8 +455,9 @@ class HuggingFaceBackend:
                                  truncation=False)
         length = inputs["input_ids"].shape[-1]
         self.last_receipt = self._receipt(length, 0)
-        if length > 4096:
-            raise GenerationFailure(f"Request contains {length} input tokens; limit is 4096. No truncation applied.")
+        if length > self.max_input_tokens:
+            raise GenerationFailure(f"Request contains {length} input tokens; limit is "
+                                    f"{self.max_input_tokens}. No truncation applied.")
         self._load_model()
         self.last_receipt = self._receipt(length, 0)
         torch = self._torch
@@ -335,5 +475,6 @@ class HuggingFaceBackend:
         truncated = len(tokens) >= request.max_new_tokens and (not tokens or tokens[-1] not in eos_ids)
         self.last_receipt = self._receipt(length, len(tokens), truncated)
         if truncated:
-            raise GenerationFailure("Generation reached its token limit without EOS; partial output rejected.", output)
+            raise OutputTruncated("Generation reached its token limit without EOS; partial output "
+                                  "kept for audit only.", output)
         return output

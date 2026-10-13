@@ -1,39 +1,52 @@
 """A transparent deterministic test double; none of its scores are model evidence."""
 from __future__ import annotations
 
-import json
 import re
 
-from .core import Plan, Request, Round, Task
+from .core import Plan, Request, Round, Task, sections
 
 
 class ScriptedTestDouble:
+    """Programmed to improve so that every selection path is exercised.
+
+    The default strategy evaluates left to right (wrong on these precedence
+    tasks). A "repair" proposal supplies order-of-operations (right), and a
+    "recalibrate" proposal only states reliability. Forecasts are read from the
+    self-model's "about N%" phrase. This is plumbing, not learning.
+    """
     identity = "scripted-test-double"
+    deterministic = True
+    FIXED = "Apply order-of-operations: multiply before adding. Check the product, then add."
 
     def complete(self, request: Request) -> str:
-        context = json.loads(request.prompt)
+        parts = sections(request.prompt)
         if request.purpose == "forecast":
-            return "100" if "order-of-operations" in context["agent"]["strategy"] else "80"
+            stated = re.search(r"about (\d+)%", parts["SELF-MODEL"])
+            return stated.group(1) if stated else "80"
         if request.purpose == "answer":
-            match = re.fullmatch(r"Compute (\d+) \+ (\d+) \* (\d+)\. Return only the integer\.",
-                                 context["task"]["prompt"])
+            match = re.search(r"Compute (\d+) \+ (\d+) \* (\d+)\. Return only the integer\.", parts["TASK"])
             if not match:
                 raise ValueError("The scripted test double only handles its documented arithmetic fixture")
             a, b, c = map(int, match.groups())
-            correct_strategy = "order-of-operations" in context["agent"]["strategy"]
-            return str(a + b * c if correct_strategy else (a + b) * c)
+            value = a + b * c if "order-of-operations" in parts["STRATEGY"] else (a + b) * c
+            return f"Working through the expression.\nANSWER: {value}"
         if request.purpose.startswith("perspective:"):
             angle = request.purpose.split(":", 1)[1]
             views = {
-                "actor": "From the actor angle, a single call applies a strategy; precedence mistakes can explain failures.",
-                "reviewer": "From the reviewer angle, prior confidence can exceed observed accuracy. Test multiplication before addition.",
-                "whole_system": "From the whole-system angle, several calls form one agent. These descriptions coexist in different contexts.",
+                "actor": "From the actor angle, I added before multiplying; precedence mistakes explain the failures.",
+                "reviewer": "From the reviewer angle, forecasts of 80% exceeded observed accuracy. Test multiplication first.",
+                "whole_system": "From the whole-system angle, the actor and reviewer describe one agent in different contexts.",
             }
             return views[angle]
-        if request.purpose == "revise_strategy":
-            return "Apply order-of-operations: multiply before adding. Return only the requested integer."
-        if request.purpose == "revise_self_model":
-            return "This scripted arithmetic fixture is solved by multiplication before addition. Other abilities remain untested."
+        if request.purpose.startswith("revise_strategy:"):
+            return self.FIXED
+        if request.purpose.startswith("revise_self_model:"):
+            strategy = parts["STRATEGY THE AGENT WILL USE"]
+            if request.purpose.endswith(":recalibrate"):
+                if "order-of-operations" in strategy:
+                    return "Precedence tasks: reliable, about 99% with this strategy."
+                return "Precedence tasks: unreliable, about 10% with this strategy."
+            return "Precedence tasks: about 95% reliable when multiplying before adding. Other abilities untested."
         raise ValueError(f"Unsupported scripted purpose: {request.purpose}")
 
 

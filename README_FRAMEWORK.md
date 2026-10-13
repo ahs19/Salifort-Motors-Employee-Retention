@@ -1,38 +1,32 @@
-# Digital Mirror — current recursive core v0.8
+# Digital Mirror: current recursive self-improvement core v0.9
 
-The project direction changed on 9 October 2026. The current implementation is
+The project goal is an AI that improves itself. The current implementation is
 in **`recursive-mirror/`**, with instructions in
-**`recursive-mirror/README.md`**. It uses recursive LLM calls to revise and test
-the agent's strategy and self-model while retaining different perspectives.
+**`recursive-mirror/README.md`**. The LLM examines its own measured behaviour
+from several perspectives, rewrites its own strategy and self-model, and keeps
+a change only when it measurably helps on fresh tasks and then on a separate
+held-out task set. It does this through an actual recursive function and
+remembers every attempted change.
 
-The daily-training design below and its related folders are preserved as the
-earlier experiment. Do not use its commands as the entry point for v0.8.
+v0.9 (13 October 2026) revises v0.8 using the evidence from its first real
+Qwen2.5-3B Colab trials on 9 October 2026, in which v0.8 did not improve
+itself. See `recursive-mirror/docs/v0.8-trial-review.md` for the call-by-call
+diagnosis and `recursive-mirror/VALIDATION.md` for what has and has not been
+verified. The v0.8 trial evidence is preserved in
+`recursive-mirror/evidence/v0.8.0-colab-20261009/`.
 
-## Historical Awareness Creator revision 0.3
+To run the bounded GPU trial, open
+`recursive-mirror/release/v0.9.0/Digital_Mirror_Recursive_v0_9.ipynb` in
+Colab with a GPU runtime and run the cells in order.
 
-The original archive has been unpacked, debugged, and revised in the
-`digital-mirror/` folder. The current Framework instructions are:
+## Historical record
 
-**`digital-mirror/README_FRAMEWORK.md`**
+The v0.8 recursive core (9 October 2026) is the first commit of
+`recursive-mirror/` in this repository's history.
 
-The current ARCHIE-WeSt instructions are:
-
-**`digital-mirror/README_ARCHIE.md`**
-
-Use the rebuilt `digital-mirror-awareness-creator.zip` (also mirrored as
-`digital-mirror-improved.zip`), not the original `digital-mirror.zip` retained
-beside it for comparison.
-
-Revision 0.2 added transactional adapter publication, post-commit crash tests,
-atomic measurement shards, a project-wide writer lock, fail-closed verification
-and GPU checks, strict grading/parsing, supervised-token control matching, a
-separate diagnostic deck, paired source decks, explicit cycle provenance, and
-updated AMD/ARCHIE setup paths. It also corrects the interpretation: one run is
-an exploratory pilot, not a significance, equivalence, causal, or falsification
-test.
-
-Revision 0.3 adds an optional evidence-grounded functional self-modeling mode,
-schema-validated daily awareness records, prospective category forecasts,
-metacognitive discrimination metrics, matched impersonal control records, and
-new regression coverage. It does not claim to create or detect phenomenal
-consciousness. See `digital-mirror/README_AWARENESS.md`.
+The earlier daily-training design (Awareness Creator revisions 0.2-0.3, in the
+`digital-mirror/` folder and its archives) is preserved outside this
+repository as the earlier experiment. Do not use its commands as the entry
+point for v0.9. Revision 0.3 added an optional evidence-grounded functional
+self-modelling mode and metacognitive metrics. Like every later revision, it
+does not claim to create or detect phenomenal consciousness.
