@@ -19,7 +19,7 @@ import time
 from typing import Callable, Protocol
 
 
-PROTOCOL = "recursive-mirror-v0.9.0"
+PROTOCOL = "recursive-mirror-v0.10.0"
 
 
 def canonical(value: object) -> str:

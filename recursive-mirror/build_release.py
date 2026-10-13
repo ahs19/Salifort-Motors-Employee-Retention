@@ -13,6 +13,9 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parent
+VERSION = "0.10.0"
+NOTEBOOK_NAME = "Digital_Mirror_Recursive_v0_10.ipynb"
+ARCHIVE_NAME = f"digital-mirror-recursive-v{VERSION}.zip"
 
 
 def sha(data: bytes) -> str:
@@ -35,7 +38,7 @@ def source_payloads(root: Path = ROOT) -> dict[str, bytes]:
         if name.endswith(".py"):
             compile(data, name, "exec")
         payloads[name] = data
-    manifest = {"format": "recursive-mirror-release-v1", "version": "0.9.0",
+    manifest = {"format": "recursive-mirror-release-v1", "version": VERSION,
                 "files": {name: {"bytes": len(data), "sha256": sha(data)}
                           for name, data in sorted(payloads.items())}}
     payloads["MANIFEST.json"] = (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode()
@@ -66,18 +69,31 @@ def make_notebook(archive: bytes) -> dict:
         cells.append({"cell_type": "code", "id": f"cell-{len(cells)}", "metadata": {}, "source": text.splitlines(True),
                       "outputs": [], "execution_count": None})
 
-    markdown("""# Digital Mirror v0.9: recursive self-improvement\n
-This notebook contains the complete reviewed source archive. It creates a fresh
-folder, checks the archive, runs software tests, then offers a **bounded GPU LLM
-self-improvement trial**. The scripted demo is not model evidence. Select a free
-GPU runtime for the model trial; no paid upgrade is required or performed here.
+    markdown("""# Digital Mirror v0.10: does the AI improve itself?\n
+**How to run.** *Runtime → Change runtime type →* pick a **GPU** (T4 works; L4 or A100 is faster) → *Save*.
+Then *Runtime → **Run all***. Keep this tab open. The last cell downloads `…_evidence.zip`:
+upload that file to Claude.
 
-Run cells individually in order. Keep the output and export partial evidence
-even if the real-model trial fails. The trial uses the shipped `headroom.json`
-plan (six exact-answer task types where small models have room to improve).
-A positive result shows measured improvement of an inference-time strategy and
-self-model on held-out tasks for this model and plan only; it does not establish
-general self-improvement or subjective awareness.
+What the cells do, in order:
+1. verify the embedded, hash-checked source archive and run the software tests;
+2. detect the GPU, install the pinned inference libraries, and test the real
+   inference stack on the GPU with a tiny local model;
+3. run a short preflight with the real model (Qwen2.5-3B-Instruct, pinned
+   revision) and print protocol diagnostics;
+4. run the experiment: for each of several independent task plans, the agent
+   recursively examines and rewrites its own strategy and self-model, keeping
+   only changes that pass paired tests on fresh tasks; then a held-out final
+   test. A control arm repeats this from a hand-written step-by-step prompt;
+5. pool the held-out results across plans and export all evidence.
+
+Expected time with the default settings: about 1.5 hours on a T4, less on L4/A100.
+Use the settings cell to shorten it (for example fewer `SEEDS`).
+If any cell stops with an error, run the **last cell** by hand: it exports
+everything produced so far, including logs of the failure.
+
+A positive result shows measured, transferable improvement of this model's
+inference-time strategy or self-model on these task types. It does not show
+general self-improvement, changed weights, or subjective awareness.
 """)
     encoded = base64.b64encode(archive).decode("ascii")
     bootstrap = '''
@@ -104,7 +120,7 @@ general self-improvement or subjective awareness.
         for name, meta in manifest["files"].items():
             assert len(data[name]) == meta["bytes"]
             assert hashlib.sha256(data[name]).hexdigest() == meta["sha256"], name
-        SESSION = Path("/content") / ("recursive_mirror_v090_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8])
+        SESSION = Path("/content") / ("recursive_mirror_v0100_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8])
         SESSION.mkdir(exist_ok=False)
         PROJECT = SESSION / "project"
         PROJECT.mkdir()
@@ -120,15 +136,29 @@ general self-improvement or subjective awareness.
     '''
     code(bootstrap.replace("__SOURCE_SHA__", sha(archive)).replace("__SOURCE_BASE64__", encoded))
     code('''
-        import subprocess
-        def captured(label, command, timeout=120):
+        # Experiment settings: edit before "Run all" for a shorter or longer run.
+        MODEL = "Qwen/Qwen2.5-3B-Instruct"
+        REVISION = "aa8e72537993ba99e69dfaafa59ed015b17504d1"  # pinned commit of MODEL; change both together
+        SEEDS = "2026,2027,2028"      # independent task plans; fewer seeds = shorter run, weaker evidence
+        RUN_CONTROL = True            # also start from a hand-written step-by-step prompt
+        ROUNDS, DISCOVERY, VALIDATION, FINAL = 3, 12, 12, 24
+        MAX_CALLS_PER_RUN = 420       # 3 levels need at most 399 calls with these sizes
+        TOTAL_HOURS = 4.0             # wall-clock budget shared by all runs of the main experiment
+        print({"model": MODEL, "seeds": SEEDS, "control": RUN_CONTROL, "hours": TOTAL_HOURS})
+    ''')
+    code('''
+        import subprocess, time, shutil
+        sys.path.insert(0, str(PROJECT))
+        ENV = dict(os.environ, HF_HOME="/content/hf_cache", USE_TF="0", TOKENIZERS_PARALLELISM="false")
+
+        def captured(label, command, timeout=120, env=None):
             print("Starting:", label, flush=True)
             log = SESSION / (label + ".log")
             # Direct file descriptors preserve partial output even if the cell
             # is interrupted before the child exits. Never overwrite a log.
             handle = log.open("x", encoding="utf-8")
             try:
-                completed = subprocess.run(command, cwd=PROJECT, stdout=handle,
+                completed = subprocess.run(command, cwd=PROJECT, stdout=handle, env=env or ENV,
                                            stderr=subprocess.STDOUT, text=True, timeout=timeout)
             finally:
                 handle.flush()
@@ -138,83 +168,147 @@ general self-improvement or subjective awareness.
             if completed.returncode:
                 raise RuntimeError(f"{label} exited {completed.returncode}; log preserved in {SESSION}")
             return completed
+
+        def streamed(label, command, timeout):
+            """Run a long child process and show its log live; returns the exit code."""
+            print("Starting:", label, flush=True)
+            log = SESSION / (label + ".log")
+            handle = log.open("x", encoding="utf-8")
+            process = subprocess.Popen(command, cwd=PROJECT, stdout=handle, stderr=subprocess.STDOUT,
+                                       text=True, env=ENV)
+            shown, deadline = 0, time.monotonic() + timeout
+            try:
+                while process.poll() is None:
+                    time.sleep(10)
+                    text = log.read_text(encoding="utf-8", errors="replace")
+                    print(text[shown:], end="", flush=True)
+                    shown = len(text)
+                    if time.monotonic() > deadline:
+                        print(f"\\n{label}: notebook timeout reached; stopping the child", flush=True)
+                        process.terminate()
+                        process.wait(120)
+            except KeyboardInterrupt:
+                process.terminate()
+                process.wait(120)
+                raise
+            finally:
+                handle.flush()
+                os.fsync(handle.fileno())
+                handle.close()
+                text = log.read_text(encoding="utf-8", errors="replace")
+                print(text[shown:], flush=True)
+            return process.returncode
+
+        def export_evidence():
+            """Zip the whole session (sources, logs, journals, results) and offer it for download."""
+            stamp = datetime.now(timezone.utc).strftime("%H%M%S")
+            export = Path("/content") / f"{SESSION.name}_evidence_{stamp}.zip"
+            with zipfile.ZipFile(export, "x", compression=zipfile.ZIP_DEFLATED) as bundle:
+                for path in sorted(SESSION.rglob("*")):
+                    if path.is_symlink():
+                        raise RuntimeError("Unexpected symlink in evidence session")
+                    if path.is_file():
+                        bundle.write(path, path.relative_to(SESSION).as_posix())
+            digest = hashlib.sha256(export.read_bytes()).hexdigest()
+            print(json.dumps({"event": "evidence_export", "path": str(export), "bytes": export.stat().st_size,
+                              "sha256": digest}))
+            try:
+                from google.colab import files
+                files.download(str(export))
+            except ImportError:
+                print("Not running in Colab: download", export, "manually.")
+            return export
+    ''')
+    code('''
         captured("unit-tests", [sys.executable, "-B", "-m", "unittest", "discover", "-s", "tests", "-v"])
-        captured("scripted-demo", [sys.executable, "-B", "-m", "recursive_mirror", "demo", "--output", str(SESSION / "scripted_demo")])
+        captured("scripted-demo", [sys.executable, "-B", "-m", "recursive_mirror", "demo", "--output",
+                                   str(SESSION / "scripted_demo")])
         print("Software checks complete. The scripted demo is NOT an LLM experiment.")
     ''')
-    markdown("""## Prepare the real-model GPU trial\n
-This cell checks for a GPU before installing inference dependencies. If no GPU
-is available, stop here. Keep the unit-test results; do not silently run the model
-on a CPU or purchase compute. The next cell may download the pinned Qwen 3B
-checkpoint into Colab's cache and makes at most 240 LLM calls (two recursive
-levels and the held-out final comparison need at most 220). Expect roughly
-30-60 minutes on a T4.
+    markdown("""## GPU, pinned libraries and a real-stack test\n
+Checks for a GPU before installing anything. The inference libraries are pinned
+(`transformers==4.57.6`). A tiny locally built Qwen2-architecture model then
+exercises the real backend on the GPU (generation, batching, EOS, truncation)
+in about a minute, before any long run.
 """)
     code('''
-        captured("gpu-status", ["nvidia-smi"], timeout=30)
+        captured("gpu-status", ["nvidia-smi"], timeout=60)
         import torch
-        assert torch.cuda.is_available(), "A GPU is required for this Colab model trial"
-        print({"gpu": torch.cuda.get_device_name(0), "torch": torch.__version__, "python": sys.version})
+        assert torch.cuda.is_available(), "No GPU: Runtime > Change runtime type > GPU, then Run all again."
+        GPU = torch.cuda.get_device_name(0)
+        CAPABILITY = torch.cuda.get_device_capability(0)
+        DTYPE = "bfloat16" if CAPABILITY[0] >= 8 else "float16"   # T4 (7.5) has native FP16 only
+        MEMORY_GB = torch.cuda.get_device_properties(0).total_memory / 1e9
+        BATCH = 16 if MEMORY_GB >= 30 else 8
         captured("inference-dependencies", [sys.executable, "-m", "pip", "install", "-q",
-                 "transformers==4.57.6", "accelerate>=0.33,<2", "bitsandbytes>=0.45,<1"], timeout=600)
+                 "transformers==4.57.6", "accelerate>=0.33,<2"], timeout=900)
         from importlib.metadata import version
-        runtime_info = {"python": sys.version, "gpu": torch.cuda.get_device_name(0),
-                        "compute_capability": list(torch.cuda.get_device_capability(0)),
-                        "versions": {name: version(name) for name in ["torch", "transformers", "accelerate", "bitsandbytes"]}}
+        runtime_info = {"python": sys.version, "gpu": GPU, "compute_capability": list(CAPABILITY),
+                        "memory_gb": round(MEMORY_GB, 1), "dtype": DTYPE, "batch_size": BATCH,
+                        "versions": {name: version(name) for name in ["torch", "transformers", "accelerate"]}}
         (SESSION / "runtime-info.json").write_text(json.dumps(runtime_info, indent=2), encoding="utf-8")
         print(json.dumps(runtime_info, indent=2))
+        captured("gpu-integration-test", [sys.executable, "-B", "-m", "unittest", "tests.test_hf_integration", "-v"],
+                 timeout=900, env=dict(ENV, RECURSIVE_MIRROR_TEST_DEVICE="cuda"))
+        MODEL_ARGS = ["--model", MODEL, "--revision", REVISION, "--allow-download", "--device", "cuda",
+                      "--dtype", DTYPE, "--batch-size", str(BATCH), "--max-input-tokens", "8192"]
     ''')
-    code('''
-        os.environ.setdefault("HF_HOME", "/content/hf_cache")
-        os.environ.setdefault("USE_TF", "0")  # transformers need not import TensorFlow
-        MODEL = "Qwen/Qwen2.5-3B-Instruct"
-        REVISION = "aa8e72537993ba99e69dfaafa59ed015b17504d1"
-        def trial(label, output, *extra):
-            captured(label, [sys.executable, "-B", "-m", "recursive_mirror", "run",
-                     "--plan", str(PROJECT / "examples" / "headroom.json"), "--output", str(output),
-                     "--model", MODEL, "--revision", REVISION, "--allow-download", "--device", "cuda", "--four-bit",
-                     "--max-input-tokens", "8192", "--max-depth", "2", "--max-calls", "240", *extra], timeout=5400)
-            result = json.loads((output / "result.json").read_text())
-            print(json.dumps({key: result[key] for key in ["status", "calls", "cache_hits", "transfer_improved",
-                             "initial_final_metrics", "candidate_final_metrics", "claim"]}, indent=2))
-            print((output / "report.md").read_text(encoding="utf-8"))
-        REAL_OUTPUT = SESSION / "real_trial"
-        trial("real-model-trial", REAL_OUTPUT)
-    ''')
-    markdown("""## Optional control: start from a hand-written step-by-step strategy\n
-The trial above measures improvement over the default starting strategy. This
-optional cell repeats the same plan from a generic hand-written reasoning prompt.
-If the loop still finds a transferable improvement from that stronger start, the
-gain is not explained by "add step-by-step reasoning" alone. It needs a similar
-amount of GPU time; skip it if the session is short.
+    markdown("""## Preflight with the real model (about 5 minutes)\n
+Downloads the pinned model once, then runs one short level on a separate small
+plan and prints diagnostics: answer-line use, invalid forecasts, truncations and
+speed. It stops before the long run only if the model cannot follow the protocol
+at all.
 """)
     code('''
-        CONTROL_OUTPUT = SESSION / "control_trial"
-        trial("control-trial", CONTROL_OUTPUT, "--initial-strategy",
-              "Think step by step. Break the task into small steps, show each intermediate result, "
-              "and check the result before the final answer line.")
+        from recursive_mirror.diagnostics import diagnose, diagnosis_markdown
+        PREFLIGHT_PLAN = SESSION / "preflight-plan.json"
+        PREFLIGHT = SESSION / "preflight"
+        captured("preflight-plan", [sys.executable, "-B", "-m", "recursive_mirror", "make-plan", "--output",
+                 str(PREFLIGHT_PLAN), "--seed", "7", "--rounds", "1", "--discovery", "6", "--validation", "3",
+                 "--final", "3"])
+        code = streamed("preflight-run", [sys.executable, "-B", "-m", "recursive_mirror", "run", "--plan",
+                        str(PREFLIGHT_PLAN), "--output", str(PREFLIGHT), *MODEL_ARGS, "--max-depth", "1",
+                        "--max-calls", "60"], timeout=3600)
+        health = diagnose(PREFLIGHT)
+        print(diagnosis_markdown(PREFLIGHT, health))
+        usable = sum(health["answer_status"].get(k, 0) for k in ("answer_line", "boxed", "last_line"))
+        if code != 0 or not usable:
+            raise RuntimeError("Preflight failed: the model did not complete the protocol. Run the last cell "
+                               "to export the evidence and send it to Claude.")
+        print("Preflight passed" + (" with warnings: " + "; ".join(health["warnings"]) if health["warnings"] else "."))
     ''')
-    markdown("""## Export evidence, including a failed or interrupted trial\n
-Run this once while the VM still has its files. It packages this new session's
-source, logs and results. Downloading the ZIP preserves evidence beyond Colab's
-temporary runtime. It does not turn a failed test into a successful one.
+    markdown("""## The experiment\n
+Each run writes its own journal, result, checkpoint and `report.md`; a pooled
+`summary.md` is rewritten after every run, so even an interrupted session keeps
+usable evidence. Progress lines appear below as levels complete.
 """)
     code('''
-        from google.colab import files
-        export = Path("/content") / (SESSION.name + "_evidence.zip")
-        with zipfile.ZipFile(export, "x", compression=zipfile.ZIP_DEFLATED) as bundle:
-            for path in sorted(SESSION.rglob("*")):
-                if path.is_symlink():
-                    raise RuntimeError("Unexpected symlink in evidence session")
-                if path.is_file():
-                    bundle.write(path, path.relative_to(SESSION).as_posix())
-        digest = hashlib.sha256(export.read_bytes()).hexdigest()
-        print(json.dumps({"event": "evidence_export", "path": str(export), "bytes": export.stat().st_size, "sha256": digest}))
-        files.download(str(export))
+        EXPERIMENT = SESSION / "experiment"
+        RUNS = len([s for s in SEEDS.split(",") if s.strip()]) * (2 if RUN_CONTROL else 1)
+        PER_RUN_SECONDS = int(TOTAL_HOURS * 3600 / RUNS)
+        command = [sys.executable, "-B", "-m", "recursive_mirror", "experiment", "--output", str(EXPERIMENT),
+                   *MODEL_ARGS, "--seeds", SEEDS, "--rounds", str(ROUNDS), "--discovery", str(DISCOVERY),
+                   "--validation", str(VALIDATION), "--final", str(FINAL), "--max-depth", str(ROUNDS),
+                   "--max-calls", str(MAX_CALLS_PER_RUN), "--max-seconds", str(PER_RUN_SECONDS)]
+        if not RUN_CONTROL:
+            command += ["--control-strategy", ""]
+        code = streamed("experiment", command, timeout=int(TOTAL_HOURS * 3600) + 3600)
+        summary = EXPERIMENT / "summary.md"
+        print(summary.read_text(encoding="utf-8") if summary.exists() else "No summary was written; see experiment.log")
+        if code:
+            print("Some runs did not complete; their evidence is still exported by the next cell.")
+    ''')
+    markdown("""## Export evidence (also run this by hand after any error)\n
+Packages this session's sources, logs, journals, results and summaries into one
+zip and downloads it. Upload the zip to Claude for analysis.
+""")
+    code('''
+        EXPORT = export_evidence()
     ''')
     return {"nbformat": 4, "nbformat_minor": 5, "cells": cells,
             "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
-                         "language_info": {"name": "python"}, "colab": {"name": "Digital_Mirror_Recursive_v0_9.ipynb"}}}
+                         "language_info": {"name": "python"}, "accelerator": "GPU",
+                         "colab": {"name": NOTEBOOK_NAME, "gpuType": "T4"}}}
 
 
 def build(output: Path) -> dict:
@@ -224,11 +318,11 @@ def build(output: Path) -> dict:
     archive = archive_bytes(payloads)
     notebook = make_notebook(archive)
     output.mkdir(parents=True, exist_ok=False)
-    archive_path = output / "digital-mirror-recursive-v0.9.0.zip"
+    archive_path = output / ARCHIVE_NAME
     archive_path.write_bytes(archive)
-    notebook_path = output / "Digital_Mirror_Recursive_v0_9.ipynb"
+    notebook_path = output / NOTEBOOK_NAME
     notebook_path.write_text(json.dumps(notebook, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
-    receipt = {"source_zip": archive_path.name, "source_sha256": sha(archive),
+    receipt = {"version": VERSION, "source_zip": archive_path.name, "source_sha256": sha(archive),
                "source_bytes": len(archive), "notebook": notebook_path.name,
                "notebook_sha256": sha(notebook_path.read_bytes()), "packaged_files": len(payloads)}
     (output / "BUILD_RECEIPT.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")

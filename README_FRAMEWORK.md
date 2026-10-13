@@ -1,32 +1,43 @@
-# Digital Mirror: current recursive self-improvement core v0.9
+# Digital Mirror: recursive self-improvement core v0.10
 
-The project goal is an AI that improves itself. The current implementation is
-in **`recursive-mirror/`**, with instructions in
-**`recursive-mirror/README.md`**. The LLM examines its own measured behaviour
-from several perspectives, rewrites its own strategy and self-model, and keeps
-a change only when it measurably helps on fresh tasks and then on a separate
-held-out task set. It does this through an actual recursive function and
-remembers every attempted change.
+The goal of this project is an AI that improves itself. The implementation is
+in **`recursive-mirror/`**, and its instructions are in
+**`recursive-mirror/README.md`**.
 
-v0.9 (13 October 2026) revises v0.8 using the evidence from its first real
-Qwen2.5-3B Colab trials on 9 October 2026, in which v0.8 did not improve
-itself. See `recursive-mirror/docs/v0.8-trial-review.md` for the call-by-call
-diagnosis and `recursive-mirror/VALIDATION.md` for what has and has not been
-verified. The v0.8 trial evidence is preserved in
-`recursive-mirror/evidence/v0.8.0-colab-20261009/`.
+The LLM examines its own measured behaviour from several perspectives and
+rewrites its own strategy and self-model. It does this through an actual
+recursive function. A change is kept only when it measurably helps on fresh
+tasks, and committed only when it also transfers to a held-out task set. The
+agent remembers every attempted change and its measured outcome.
 
-To run the bounded GPU trial, open
-`recursive-mirror/release/v0.9.0/Digital_Mirror_Recursive_v0_9.ipynb` in
-Colab with a GPU runtime and run the cells in order.
+**Run the experiment:** open
+[`recursive-mirror/release/v0.10.0/Digital_Mirror_Recursive_v0_10.ipynb` in Colab](https://colab.research.google.com/github/ahs19/Salifort-Motors-Employee-Retention/blob/claude/self-improve-ai-revision-3o1opd/recursive-mirror/release/v0.10.0/Digital_Mirror_Recursive_v0_10.ipynb).
+Choose a GPU runtime, then *Runtime → Run all*. Upload the downloaded
+evidence zip for analysis.
 
-## Historical record
+## Version history
 
-The v0.8 recursive core (9 October 2026) is the first commit of
-`recursive-mirror/` in this repository's history.
+- **v0.10 (13-14 October 2026).** Hardened for the first real run:
+  - the inference path checked against the real `torch` and `transformers`
+    stack;
+  - a multi-agent review in which skeptics tried to refute each finding;
+  - pure greedy decoding;
+  - one lever per proposal kind;
+  - batched GPU generation;
+  - replicated experiments with a hand-written control arm and pooled
+    held-out analysis.
+
+  See `recursive-mirror/VALIDATION.md`.
+- **v0.9 (13 October 2026).** Revised v0.8 in response to its failed real
+  trials. See `recursive-mirror/docs/v0.8-trial-review.md`.
+- **v0.8 (9 October 2026).** The first recursive core. Its first real
+  Qwen2.5-3B Colab trials did not improve the agent. That evidence is
+  preserved in `recursive-mirror/evidence/v0.8.0-colab-20261009/`, and the
+  v0.8 source is the first commit of `recursive-mirror/` in this repository's
+  history.
 
 The earlier daily-training design (Awareness Creator revisions 0.2-0.3, in the
-`digital-mirror/` folder and its archives) is preserved outside this
-repository as the earlier experiment. Do not use its commands as the entry
-point for v0.9. Revision 0.3 added an optional evidence-grounded functional
-self-modelling mode and metacognitive metrics. Like every later revision, it
-does not claim to create or detect phenomenal consciousness.
+`digital-mirror/` folder and its archives) is kept outside this repository as
+the earlier experiment. Do not use its commands as the entry point. Like every
+later revision, it does not claim to create or detect phenomenal
+consciousness.

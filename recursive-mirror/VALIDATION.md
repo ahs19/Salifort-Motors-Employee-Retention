@@ -1,93 +1,99 @@
-# v0.9 implementation validation (13 October 2026)
+# v0.10 validation (13-14 October 2026)
 
-Status: the recursive self-improvement revision is implemented and passes the
-local software checks. **No real-model v0.9 trial has been run yet.** The
-container used for this revision has no GPU, and its network policy blocks
-huggingface.co, so model weights could not be obtained. The bounded Colab T4
-trial in `release/v0.9.0/Digital_Mirror_Recursive_v0_9.ipynb` is the next step.
+**Status:** ready for its first real-model run, which has not happened yet.
+Every part of the inference path was exercised against the real
+`torch 2.14.1` and `transformers 4.57.6` libraries, with a tiny locally built
+Qwen2-architecture model on CPU. No real Qwen2.5-3B weights were available,
+because the container's network policy blocks huggingface.co.
+
+The real experiment is
+`release/v0.10.0/Digital_Mirror_Recursive_v0_10.ipynb` on a Colab GPU. Its
+preflight cell is the first real-model check.
 
 ## Software checks
 
 ```text
 python -B -m unittest discover -s tests -v
-Ran 80 tests ... OK            (Python 3.11, 3.12 and 3.13.16; Linux; standard library only)
+  Python 3.11, 3.12, 3.13 (standard library only): 102 tests, OK (7 opt-in skipped)
+RECURSIVE_MIRROR_TEST_DEVICE=cpu python -B -m unittest discover -s tests
+  Python 3.12 + torch 2.14.1 + transformers 4.57.6: 102 tests, OK
 ```
 
-The packaged source archive was also extracted to an empty directory and its
-own test suite run there, as the notebook does. That gave 79 tests OK and 1
-skipped: the skipped test loads the real v0.8 Colab checkpoint, and the
-`evidence/` folder is not shipped inside the archive.
+| test module | tests | covers |
+|---|---|---|
+| test_core | 57 | the recursive engine (details below) |
+| test_runtime | 22 | checkpoints, the HF backend, the CLI |
+| test_tasks | 6 | `make-plan`, re-deriving every expected answer from the prompt text |
+| test_experiment | 4 | replicated runs, control arm, failure isolation, pooled statistics, CLI |
+| test_release | 6 | archive, notebook order and budgets; the committed release must embed exactly the current sources |
+| test_hf_integration | 7 | opt-in, real library stack (details below) |
 
-The suite has 47 recursive-core tests (including regression tests that replay
-each v0.8 Colab failure), 22 runtime/checkpoint/backend/CLI tests, 6 task-plan
-tests that re-derive every expected answer independently from the prompt text,
-and 5 release/notebook tests. Backends were deterministic test doubles or
-mocks; no neural model was loaded or downloaded.
+`test_core` covers:
 
-Verified behaviours include:
+- live-stack recursion;
+- frozen proposals;
+- answer-key isolation;
+- one lever per proposal kind;
+- the gate, including the evidence bound;
+- batching;
+- caching;
+- budgets, including wall-clock;
+- regression tests that replay each v0.8 Colab failure.
 
-- genuine nested recursion, observed from the live call stack, with the
-  improved state reaching the next level;
-- every proposal journalled (frozen) before any validation request; paired
-  seeds and identical task text for the parent and every candidate;
-- validation and final answer keys never appear in any model request.
-  Discovery reference answers appear only in reflection/proposal requests,
-  only for missed tasks, and not at all with `--hide-discovery-answers`;
-- answer requests carry the strategy but never the self-model;
-- a truncated perspective, answer or proposal is recorded and the run
-  continues. v0.8 aborted on the first truncated perspective;
-- a parent's malformed forecast (the v0.8 "216" case) cannot create a
-  candidate calibration gain;
-- one malformed candidate forecast does not veto a real accuracy gain, but
-  malformed forecasts cannot hide a calibration collapse or a coverage loss;
-- the paired p-value is exact (it equals the sign test for accuracy), weights
-  effect size for calibration, and is deterministic;
-- unchanged, empty, truncated or over-long proposals are ineligible and cost
-  no validation calls;
-- the attempt ledger (accepted, passed-not-selected, rejected, ineligible,
-  final transfer) persists and is shown to later levels;
-- deterministic-backend replay of identical requests, and none for sampling
-  backends;
-- checkpoint v2 round trip, tamper and type-confusion rejection, matching
-  save/load limits for all three histories, v1 (v0.8) checkpoint upgrade with
-  its original hashes, and loading plus continuing the real v0.8 Colab
-  checkpoint;
-- `make-plan` determinism, disjointness, category balance, and the shipped
-  `examples/headroom.json` equal to the generator output;
-- notebook archive verification, bounded and revision-pinned GPU trial
-  (at most 240 calls; the shipped plan needs at most 220), and log
-  preservation on interruption.
+`test_runtime` covers:
 
-## Scripted demo and noisy simulation (software evidence only)
+- checkpoint v2/v1, tamper and limits;
+- the HF backend contract: pure greedy decoding, filtered inputs, dtype;
+- every CLI command.
 
-`python -m recursive_mirror demo` exercises every selection path:
+`test_hf_integration` covers, on the real library stack:
 
-- level 0: `repair` is selected (accuracy 0% → 100%), and `recalibrate`
-  passes but is not selected;
-- level 1: `repair` is unchanged, and `recalibrate` is rejected (no declared
-  gain);
-- the final transfer passes (accuracy 0% → 100% on 3 tasks).
+- EOS and truncation;
+- the input limit;
+- **batched rows equal single requests exactly (CPU float32)**;
+- a full recursive run;
+- the CLI.
 
-The double is programmed to improve. It is not LLM evidence.
+## What running the real stack found and fixed
 
-A noisy simulator, kept outside the repository, ran the full headroom plan. It
-emits malformed forecasts, truncated answers and reflections, over-long and
-non-executable proposals, and random answer errors. It exposed two gate
-weaknesses, both fixed before release:
+- **Repetition penalty.** Qwen2.5's `repetition_penalty: 1.05` is applied
+  under `do_sample=False` (confirmed: `RepetitionPenaltyLogitsProcessor` is
+  active). Decoding is now plain argmax.
+- `generate()` rejected `token_type_ids`. Only `input_ids` and
+  `attention_mask` are passed now.
+- `torch_dtype` is deprecated; the `dtype=` keyword is used where supported.
+- Warnings about ignored sampling flags are gone, because the flags are
+  cleared explicitly.
 
-1. Requiring every candidate forecast to be valid let format noise veto real
-   accuracy gains.
-2. Accepting any single net win let a junk "expand the training dataset"
-   strategy pass on noise alone.
+## End-to-end pipeline check
 
-After the fixes, runs completed with no aborts, the largest request stayed
-under 8,100 characters (far below the 8,192-token input bound), and the junk
-strategies were rejected or rolled back by the final test.
+`python -m recursive_mirror experiment` ran with the real backend and a tiny
+random model on CPU:
+
+- 2 seeds × (self + control);
+- 70 calls per run;
+- batched generation;
+- summary, reports and diagnostics.
+
+The random model produces gibberish, and `diagnose` flagged exactly that:
+every reply truncated, no `ANSWER:` lines, no valid forecasts. The preflight
+shows the same check for the real model before the long run.
+
+## Multi-agent review
+
+Four specialist reviewers each had a paired skeptic:
+
+- real inference and Colab;
+- small-LLM protocol behaviour, using the v0.8 Qwen journals;
+- selection statistics;
+- persistence, CLI and tasks.
+
+Confirmed or adopted findings are documented in
+`docs/v0.8-trial-review.md` under "Found before the first v0.9 run".
 
 ## What this does not establish
 
-These checks establish software behaviour only. Whether a real 3B model can
-improve its own strategy or self-model and transfer that gain to held-out
-tasks is untested. No v0.9 model improvement, awareness or general
-self-improvement result has been established. The v0.8 trial results remain
-as recorded in `evidence/` and `docs/v0.8-trial-review.md`.
+These checks establish software behaviour, not learning. It is still untested
+whether Qwen2.5-3B can improve its own strategy or self-model and transfer the
+gain to held-out tasks. In particular, it is untested whether it can do better
+than a hand-written step-by-step prompt. No awareness claim is made.

@@ -13,7 +13,10 @@ from unittest.mock import patch
 from recursive_mirror.cli import main
 from recursive_mirror.core import Config, sections
 from recursive_mirror.experiment import DEFAULT_CONTROL_STRATEGY, run_experiment, summarize
-from test_tasks import solve
+try:
+    from test_tasks import solve          # unittest discover -s tests
+except ImportError:  # pragma: no cover - run as a dotted module from the project root
+    from tests.test_tasks import solve
 
 
 class HeadroomDouble:

@@ -104,6 +104,8 @@ def _model_options(run: argparse.ArgumentParser) -> None:
     run.add_argument("--initial-self-model", help="Start from this self-model; not combinable with --state")
     run.add_argument("--batch-size", type=int, default=Config.batch_size,
                      help="Independent evaluation requests generated together on the GPU")
+    run.add_argument("--max-seconds", type=int, default=0,
+                     help="Wall-clock budget per run: stop recursing, still run the final test (0 = none)")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -131,7 +133,8 @@ def main(argv: list[str] | None = None) -> int:
             config = Config(max_depth=args.max_depth, max_calls=args.max_calls, patience=args.patience,
                             candidate_kinds=args.candidates, answer_tokens=args.answer_tokens,
                             reveal_discovery_answers=not args.hide_discovery_answers, seed=args.seed,
-                            max_p_value=args.max_p_value, batch_size=args.batch_size)
+                            max_p_value=args.max_p_value, batch_size=args.batch_size,
+                            max_seconds=args.max_seconds)
             model = HuggingFaceBackend(args.model, allow_download=args.allow_download,
                                        device=args.device, four_bit=args.four_bit,
                                        revision=args.revision, max_input_tokens=args.max_input_tokens,

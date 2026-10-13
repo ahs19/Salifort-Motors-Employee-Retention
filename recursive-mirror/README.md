@@ -1,17 +1,18 @@
-# Digital Mirror 0.9: recursive self-improvement
+# Digital Mirror 0.10: recursive self-improvement
 
-The goal of this project is an AI that improves itself. In v0.9 the agent
-repeatedly examines its own measured behaviour and rewrites its own working
-method. It keeps a change only after the change measurably helps on tasks it
-has never seen. The recursion is an actual recursive Python function: each
-level calls the LLM, evaluates the result, and passes the improved state into
-the next call of itself.
+The goal of this project is an AI that improves itself. The agent repeatedly
+examines its own measured behaviour from several perspectives and rewrites its
+own working method. It keeps a change only when the change measurably helps on
+fresh tasks, and commits it only when the gain also transfers to held-out tasks
+that played no part in any decision. The recursion is an actual recursive
+Python function: each level calls the LLM, evaluates the result, and passes the
+improved state into the next call of itself.
 
 What improves is the agent's **persistent state**:
 
 - **strategy**: the working instructions the agent follows on every task;
 - **self-model**: what the agent believes about its own reliability, used
-  when it predicts its own success;
+  when it predicts its own success before answering;
 - **memory**: every observation, every perspective, and every attempted
   change with its measured result.
 
@@ -20,80 +21,118 @@ budgets, tasks or answer keys. Subjective awareness remains a research
 hypothesis: a depth limit, eloquent reflection, agreement or a stable state
 does not certify it.
 
-## Why v0.9
+## Run the experiment on Colab
 
-v0.8 ran on a real model (Qwen2.5-3B on a Colab T4) on 9 October 2026 and did
-not improve itself. The first trial aborted when one reflection hit the token
-limit. In the second trial the model proposed "expand the training dataset"
-as its strategy, which it could not carry out and which made its answers worse
-(38 + 47 → 125). A proposal was also "accepted" only because the parent's
-forecast was malformed. [`docs/v0.8-trial-review.md`](docs/v0.8-trial-review.md)
-traces each failure to its cause, call by call, and maps it to the v0.9 change.
-In short, v0.9:
+1. Open [`release/v0.10.0/Digital_Mirror_Recursive_v0_10.ipynb` in Colab](https://colab.research.google.com/github/ahs19/Salifort-Motors-Employee-Retention/blob/claude/self-improve-ai-revision-3o1opd/recursive-mirror/release/v0.10.0/Digital_Mirror_Recursive_v0_10.ipynb).
+   For a private repository, Colab first asks you to authorise GitHub.
+2. *Runtime → Change runtime type →* a GPU (T4 works; L4 or A100 is faster).
+3. *Runtime → Run all*, and keep the tab open.
 
-1. tells the model exactly which levers exist and how its text will be used;
-2. lets strategies change how the agent works (reasoning is allowed; the
-   harness extracts a final `ANSWER:` line);
-3. tests the strategy where it acts (answers) and the self-model where it acts
-   (forecasts);
-4. remembers every attempted change and its measured result, so later levels
-   can learn from earlier ones;
-5. proposes several kinds of candidate per level and selects among them;
-6. compares calibration only on paired valid forecasts, so a formatting
-   failure cannot pose as an improvement;
-7. survives truncated or empty outputs without aborting the experiment;
-8. ships task plans with real headroom, because the v0.8 canary was already
-   solved at 100%.
+The last cell downloads `…_evidence.zip`. If any cell stops with an error, run
+that last cell by hand: it exports everything produced so far. The default
+settings take about 1.5 hours on a T4.
+
+The notebook works through these steps in order:
+
+1. verifies the embedded, hash-checked source archive;
+2. runs the unit tests;
+3. checks for a GPU and installs the pinned `transformers==4.57.6`;
+4. tests the real inference stack on the GPU with a tiny locally built model;
+5. runs a short preflight with the real model (Qwen2.5-3B-Instruct, pinned
+   revision) and prints protocol diagnostics;
+6. runs the experiment (three task plans × self arm and control arm);
+7. writes a pooled `summary.md`.
+
+## Why v0.10
+
+**v0.8 → v0.9.** v0.8 ran on the real model on 9 October 2026 and did not
+improve itself. [`docs/v0.8-trial-review.md`](docs/v0.8-trial-review.md) traces
+each failure call by call:
+
+- one truncated reflection aborted the first trial;
+- the model proposed "expand the training dataset" as its strategy, which
+  made its answers worse;
+- one proposal was "accepted" only because the parent's forecast was
+  malformed.
+
+**v0.9 → v0.10.** Before any GPU time was spent, the whole inference path was
+run against the real `torch` and `transformers` libraries. A multi-agent
+review with adversarial checks also went through every protocol detail. They
+found:
+
+- **Decoding was not truly greedy.** Qwen2.5 ships `repetition_penalty: 1.05`,
+  and transformers applies it even with `do_sample=False`. Every digit or
+  letter already in the prompt was penalised. Decoding is now plain argmax,
+  and the receipts record it.
+- **One lever per proposal.** A long self-model reply (v0.8's were 1541
+  characters) could discard a good strategy. A strategy was also forecast
+  with a self-model that described the *old* strategy, so calibration could
+  veto a real accuracy gain. Now `repair` and `rewrite` change only the
+  strategy and are judged on answers. `recalibrate` changes only the
+  self-model and is judged on forecasts.
+- **Forecasts that are task answers.** A forecast equal to the task's answer
+  (v0.8 answered "216" when asked for a probability) is now invalid.
+  Forecasts are requested as percentages.
+- **Answer extraction** now handles Qwen's habits (`<…>`, `$…$`, `\boxed{}`, a
+  trailing "answer:"). The same format-only rules apply to every arm.
+- **Prompt hygiene.** Hashes, backend identities and budgets are no longer
+  shown to the model, which had copied them into its reflections. Reflections
+  now get up to 1500 characters of the agent's reasoning for missed tasks and
+  smoothed per-type calibration, and the repair brief is evidence-led. Advice
+  about training or fine-tuning is screened out before any validation calls.
+- **Batched generation.** Independent evaluation requests run in GPU batches.
+  This is several times faster, which pays for larger task sets and stronger
+  statistics. On the real library, batched rows match single requests
+  exactly on CPU float32.
+- **Replicated experiments** with a hand-written control arm and pooled
+  held-out analysis (`experiment`, `summarize`), plus `diagnose` for
+  protocol health. A wall-clock budget lets a slow GPU still finish with a
+  report, and a preflight runs before the long run.
 
 ## The recursive self-improvement loop
 
 `recursive_mirror/core.py:RecursiveMirror._recurse` runs one level:
 
 1. **Act.** On fresh discovery tasks, the agent first forecasts its
-   probability of being exactly right (one integer, 0-100), then answers. It
-   may reason; it finishes with `ANSWER: <answer>`. The harness scores the
-   extracted answer by deterministic exact match.
-2. **Reflect from three angles.** The *actor* explains each miss, the
-   *reviewer* checks calibration and earlier attempts, and the *whole system*
-   view integrates both and names the most valuable change. Each sees the
-   harness evidence: every discovery task, the agent's answer, the
-   reference answer and a reasoning excerpt for each miss, per-category
-   calibration of the current policy, the recent attempt ledger and earlier
-   views.
-3. **Propose.** Each configured kind produces a complete candidate policy:
-   - `repair`: a new strategy that fixes the observed errors, plus a
-     matching self-model;
-   - `rewrite`: a substantially different strategy (optional);
-   - `recalibrate`: the same strategy with a corrected self-model.
+   probability of being exactly right, then answers. It may reason, and it
+   finishes with `ANSWER: <answer>`. The harness scores the extracted answer
+   by deterministic exact match.
+2. **Reflect from three angles.** The *actor* explains each miss. The
+   *reviewer* checks calibration and earlier attempts. The *whole-system*
+   view integrates both, says where they conflict and in which context each
+   holds, and names the most valuable change. All three see the evidence:
+   - each discovery task, the agent's answer and the reference answer;
+   - a reasoning excerpt for each miss;
+   - smoothed calibration of the current policy per task type;
+   - recent attempts with their measured outcomes;
+   - earlier views.
+3. **Propose, one lever per kind.**
+   - `repair` writes a new strategy that fixes the observed errors.
+   - `rewrite` writes a substantially different strategy (optional).
+   - `recalibrate` writes a new self-model for the unchanged strategy.
 
-   A candidate that is truncated, empty, over-long or unchanged is recorded
-   as ineligible and costs no validation calls.
+   Unchanged, empty, truncated, over-long or non-executable proposals are
+   recorded as ineligible and cost no validation calls.
 4. **Freeze, then validate.** Every proposal is journalled before any
    validation request. The parent and each candidate run on the same fresh
    validation tasks with paired seeds. Validation answer keys never reach
    the model.
-5. **Select.** A candidate passes the gate (`core.compare`) when:
-   - accuracy does not fall, and overall Brier loss does not rise. An invalid
-     forecast counts as the worst possible loss, so malformed forecasts can
-     never hide miscalibration;
-   - it shows at least one **consistent** gain. Either accuracy rises by
-     `min_accuracy_gain`, or Brier loss falls by `min_brier_gain` on tasks
-     where *both* arms forecast validly (with no loss of forecast coverage).
-     In both cases the paired one-sided p-value across tasks must be at most
-     `max_p_value` (default 0.25).
+5. **Select (`core.compare`).** Accuracy is the primary objective.
+   - Accuracy may never fall.
+   - An accuracy gain passes when it is at least `min_accuracy_gain` and its
+     one-sided paired p-value across tasks is at most `max_p_value` (default
+     0.25).
+   - Otherwise a calibration gain passes when all of these hold: the Brier
+     loss falls on tasks where *both* arms forecast validly, with the same
+     p-value bound; forecast coverage does not drop; and overall Brier does
+     not rise (an invalid forecast counts as the worst loss).
 
-   The best passing candidate becomes the next state. Every candidate,
-   accepted or not, enters the attempt ledger.
-
-   The p-value bound matters. Without it, an irrelevant strategy that merely
-   reshuffles answers gains one net task, and passes, about 40% of the time
-   on 8-12 tasks. With it, about 13-15% of such candidates pass, while about
-   70-85% of genuine +40-point improvements still do (simulated with
-   independent arms). The final held-out test applies the same gate again.
+   The best passing candidate becomes the next state. Every candidate enters
+   the attempt ledger.
 6. **Recurse.** `_recurse(next_state, level + 1, …)` is called directly. It
-   stops at the depth limit, the call budget (the final test is always
-   reserved), the end of the plan, or after `patience` levels without an
-   accepted change.
+   stops at the depth limit, the call or time budget (the final test is
+   always reserved), the end of the plan, or after `patience` levels without
+   progress.
 
 After the recursion returns, the selected policy and the initial policy run on
 a separate final task set. The new policy is committed only if it passes the
@@ -101,132 +140,128 @@ same gate there. Otherwise the strategy and self-model roll back, while all
 memory (observations, perspectives, attempts, including the failed transfer)
 is kept for the next run.
 
-### Deterministic replay
+The p-value bound matters. Without it, an irrelevant strategy that merely
+reshuffles answers gains one net task, and passes, about 40% of the time on
+8-12 tasks. With it, about 13-15% of such candidates pass, while about 70-85%
+of genuine +40-point improvements still do (simulated with independent arms).
+The held-out final test applies the same gate again.
 
-The Hugging Face backend uses greedy decoding and declares itself
-deterministic. Within one run, a byte-identical request then reuses its first
-reply instead of calling the model again. For example, a `recalibrate`
-candidate keeps the parent's strategy, so its answer requests are identical to
-the parent's. Paired comparisons stay exact, and calls are saved (reported as
-`cache_hits`). Backends that sample are never cached.
+**Deterministic replay.** Greedy decoding is declared deterministic, so within
+a run a byte-identical request reuses its first reply. A `recalibrate`
+candidate therefore gets exactly the parent's answers, and an unchanged policy
+costs nothing in the final test. Batched generation can round slightly
+differently from single requests on a GPU, but it stays deterministic for a
+given batch.
 
-## Paradox and perspective
+## Experiment design
 
-Here "paradox" keeps the project's meaning: different angles on the same
-system can yield different descriptions. The harness preserves each
-description with its angle, level and state identity, flags incomplete ones,
-and never demands consensus. All three views come from the same LLM: they are
-perspectives, not independent witnesses. Only the accepted strategy and
-self-model enter task-solving prompts, so keeping a rejected view for
-examination never deploys it.
+`python -m recursive_mirror experiment` runs every seed's independently
+generated plan twice. The *self* arm starts from the plain default policy. The
+*control* arm starts from a hand-written step-by-step prompt. `summary.md`
+then pools the held-out final tasks across seeds to answer three questions:
 
-## Running it
+1. **Self vs initial:** did the policy the loop selected beat the policy it
+   started from?
+2. **Self vs control:** did it beat a good hand-written prompt on the same
+   tasks? This separates "the loop discovered something" from "any
+   step-by-step instruction helps".
+3. **Control self-improvement:** can the loop improve even that hand-written
+   prompt?
 
-The core and its tests need Python 3.11+ and the standard library only. From
-this directory:
+Each run also has its own `report.md`, and `summary.md` includes held-out
+accuracy per task type. Task plans come from `make-plan`: exact-answer tasks
+with headroom for small models (multi-digit multiplication, letter counting,
+word reversal, decimal comparison, multi-step arithmetic, weekday offsets).
+Python computes every answer, and every plan is disjoint across its splits.
+
+## Running locally
+
+The core and its tests need Python 3.11+ and the standard library only:
 
 ```powershell
 python -m unittest discover -s tests -v
 python -m recursive_mirror demo --output runs/demo-001
 ```
 
-The demo is a scripted test double programmed to improve, so that every
-selection path is exercised. It is **not** LLM evidence.
-
-Generate a task plan with headroom, or use the shipped
-`examples/headroom.json` (seed 2026: 2 levels × (6 discovery + 10 validation)
-plus 16 final tasks):
+The demo is a scripted test double programmed to improve. It is not LLM
+evidence. The real-stack integration tests are opt-in: with `torch`,
+`transformers` and `tokenizers` installed, set
+`RECURSIVE_MIRROR_TEST_DEVICE=cpu` (or `cuda`).
 
 ```powershell
-python -m recursive_mirror make-plan --output plans/seed7.json --seed 7 --rounds 3 --discovery 6 --validation 10 --final 20
+python -m recursive_mirror make-plan --output plans/seed7.json --seed 7 --rounds 3 --discovery 12 --validation 12 --final 24
+python -m recursive_mirror run --plan examples/headroom.json --output runs/real-001 --model Qwen/Qwen2.5-3B-Instruct --revision aa8e72537993ba99e69dfaafa59ed015b17504d1 --allow-download --device cuda --max-depth 2 --max-calls 240
+python -m recursive_mirror experiment --output runs/exp-001 --model Qwen/Qwen2.5-3B-Instruct --revision aa8e72537993ba99e69dfaafa59ed015b17504d1 --allow-download --device cuda --seeds 2026,2027,2028 --max-depth 3 --max-calls 420
+python -m recursive_mirror summarize runs/exp-001
+python -m recursive_mirror diagnose runs/exp-001/seed-2026/self
 ```
-
-Run a real model (install `torch`, `transformers`, `accelerate` and, for
-`--four-bit`, `bitsandbytes` first):
-
-```powershell
-python -m recursive_mirror run --plan examples/headroom.json --output runs/real-001 --model C:\models\Qwen2.5-3B-Instruct --device cuda --four-bit --max-depth 2 --max-calls 240
-```
-
-Useful options:
 
 | option | default | meaning |
 |---|---|---|
 | `--candidates` | `repair,recalibrate` | proposal kinds per level (`repair`, `rewrite`, `recalibrate`) |
-| `--max-depth`, `--patience` | 4, 2 | recursion depth, levels without progress before stopping |
-| `--max-calls` | 400 | hard LLM call budget (final test reserved) |
+| `--max-depth`, `--patience` | 4, 2 | recursion depth; levels without progress before stopping |
+| `--max-calls`, `--max-seconds` | 400, 0 | per-run call and wall-clock budgets (the final test is always reserved) |
+| `--batch-size` | 8 | independent evaluation requests generated together |
 | `--answer-tokens` | 512 | output budget for answers (reasoning included) |
 | `--max-p-value` | 0.25 | evidence bound on every accepted gain (1 disables it) |
-| `--max-input-tokens` | 8192 | longer prompts are refused, never truncated (v0.8 used 4096) |
+| `--dtype` | auto | auto = float16 on CUDA, float32 on CPU; bfloat16 suits L4/A100 |
+| `--max-input-tokens` | 8192 | longer prompts are refused, never truncated |
 | `--hide-discovery-answers` | off | do not show reference answers for missed discovery tasks |
-| `--initial-strategy`, `--initial-self-model` | defaults | start from a hand-written policy (a control run) |
-| `--state` | none | continue from a checkpoint (same model identity, fresh tasks) |
-
-The call budget for one level is at most `2·discovery + 3 + proposal calls +
-2·validation·(1 + candidates)`, plus `4·final` once. The shipped plan needs at
-most 220 calls for two levels.
+| `--initial-strategy`, `--initial-self-model` | defaults | `run` only: start from a hand-written policy |
+| `--state` | none | `run` only: continue from a checkpoint (same model identity, fresh tasks) |
 
 Remote downloads require `--allow-download` and an immutable 40-character
-`--revision`. A CUDA run must actually have CUDA. Each real call records its
-input/output token counts, revision, device and dtype. These receipts do not
-independently verify model-weight bytes.
+`--revision`. Each real call records its input and output tokens, revision,
+device, dtype, decoding and generation time. These receipts do not
+independently verify model-weight bytes. Checkpoints are hash-checked (format
+v2, which adds the attempt ledger); v1 checkpoints from v0.8 still load. Their
+backend identity differs, because v0.8 decoding was not purely greedy, so they
+continue through the Python API rather than the CLI.
 
-**Continuing.** `--state runs/real-001/checkpoint.json` carries the committed
-policy and all memory forward. Supply a fresh plan, for example from
-`make-plan` with a new seed: a reused task ID or normalized prompt is
-rejected. The checkpoint hash detects accidental modification; it is not a
-signature. v0.8 checkpoints (format v1) still load. Their backend identity
-must match, which for v0.8 runs means `--max-input-tokens 4096`.
-
-**Colab.** `python build_release.py` writes a verified source archive and
-`Digital_Mirror_Recursive_v0_9.ipynb`. The notebook checks the archive, runs
-the tests and the demo, then runs the pinned Qwen2.5-3B self-improvement
-trial on the headroom plan. An optional control run starts from a hand-written
-step-by-step strategy. A final cell exports all evidence, including from
-failed runs.
+`python build_release.py --output release/vX.Y.Z` rebuilds the source archive
+and notebook. A test fails if the committed release does not embed exactly
+the current sources.
 
 ## Outputs
 
 Every run uses a new directory:
 
 - `journal.jsonl`: every request, raw response, truncation, cache hit,
-  observation, proposal, selection and failure, flushed as it happens;
-- `plan.json`: the exact plan used;
-- `result.json`: per-level comparisons, the final comparison and both states;
-- `checkpoint.json`: the committed state, hash-checked (format v2);
-- `report.md`: a readable summary covering what was tried at each level, what
-  passed, the final held-out comparison and the committed policy.
+  observation, proposal, selection and failure, flushed as it happens with
+  elapsed time;
+- `plan.json`, `result.json` and `checkpoint.json`;
+- `report.md`: what was tried at each level, what passed, the final held-out
+  comparison and the committed policy.
 
-A failed run leaves its journal and publishes no result or checkpoint.
+An experiment directory adds `experiment.json`, `summary.md` and
+`summary.json`, and a `failure.txt` for any run that crashed. The other runs
+still complete. A failed run publishes no result or checkpoint.
 
 ## Reading a result honestly
 
-- `transfer_improved: true` means the self-revised policy beat the initial
-  policy on held-out tasks under the declared gate, for this model and plan.
-  It does not mean general self-improvement.
+- A positive pooled *self vs initial* result means the self-revised policy
+  answered held-out tasks better than its starting policy, for this model and
+  these task types. It does not mean general self-improvement.
+- The *self vs control* row decides whether the loop added anything beyond a
+  generic step-by-step prompt. Without that, a gain may simply be
+  "reasoning helps".
 - The gates are exploratory. The p-value bound is not corrected for the
-  several candidates and levels tried, and 0.25 is lenient by design so that
-  real gains on small task sets can pass. With 16 final tasks, even a clear
-  gain is uncertain. Repeat with new plans (new seeds) before drawing
-  conclusions.
-- Improvement is measured relative to the starting policy. The default start
-  ("return only the requested answer") is deliberately plain. Use
-  `--initial-strategy` with a good hand-written prompt to test whether the
-  loop adds anything beyond "think step by step".
+  several candidates, levels and comparisons, and 0.25 is lenient by design
+  so that real gains on small task sets can pass. The pooled p-values over
+  all seeds are the better guide.
 - Selecting the best of several candidates on validation inflates validation
-  scores. Only the final comparison should be read as evidence.
+  scores. Read the held-out final comparisons.
 - Revealing reference answers for missed discovery tasks is a deliberate
-  learning signal. Discovery tasks are never used for selection; validation
-  and final keys are never shown.
+  learning signal. Discovery tasks are never used for selection, and
+  validation and final keys are never shown.
 - Exact-prompt disjointness cannot detect paraphrases or leakage from the
   model's pre-training data.
 
-## Next measurements
+## Next steps
 
-1. Run the shipped notebook trial and its control on the T4, then repeat with
-   fresh `make-plan` seeds.
-2. Continue a committed checkpoint on a new plan to test whether gains
-   accumulate across runs.
-3. Use the verified-correct reasoning traces in the journal as candidate
+1. Run the notebook and analyse the evidence zip.
+2. If the loop transfers, continue committed checkpoints on fresh plans to
+   test whether gains accumulate.
+3. Use the verified-correct reasoning traces in the journals as candidate
    training data for a separate, weight-level self-training stage. That stage
    would need its own held-out evaluation and is not implemented here.
