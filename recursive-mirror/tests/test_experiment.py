@@ -85,6 +85,27 @@ class ExperimentTests(unittest.TestCase):
         # The same analysis can be recomputed from the saved files alone.
         self.assertEqual(summarize(self.root / "exp"), summary)
 
+    def test_pooled_calibration_ignores_missing_forecasts(self):
+        # Multi-agent review: counting a missing forecast as loss 1.0 made identical forecasts
+        # look like a "significant" pooled calibration gain.
+        from recursive_mirror.experiment import _paired
+        def rows(missing):
+            return {f"t{i}": {"correct": i % 2 == 0, "probability": None if i in missing else 0.9}
+                    for i in range(24)}
+        pooled = _paired(rows({1, 2, 3}), rows(set()))
+        self.assertEqual((pooled["coverage_before"], pooled["coverage_after"]), (21 / 24, 1.0))
+        self.assertEqual(pooled["paired_forecasts"], 21)
+        self.assertEqual(pooled["brier_before"], pooled["brier_after"])
+        self.assertEqual(pooled["brier_p"], 1.0)
+
+    def test_total_time_budget_is_shared_out_as_it_is_spent(self):
+        run_experiment(HeadroomDouble(), self.root / "exp", seeds=(1, 2), config=Config(max_depth=1),
+                       log=lambda line: None, total_seconds=4000, **SIZES)
+        budgets = [json.loads((self.root / "exp" / f"seed-{seed}" / arm / "result.json").read_text())["config"]["max_seconds"]
+                   for seed in (1, 2) for arm in ("self", "control")]
+        self.assertTrue(all(0 < b <= 4000 for b in budgets))
+        self.assertGreaterEqual(budgets[-1], budgets[0])  # unspent time carries over to later runs
+
     def test_one_failed_run_does_not_discard_the_others(self):
         summary = run_experiment(HeadroomDouble(fail_on="Think step by step. Break"), self.root / "exp",
                                  seeds=(3,), config=Config(max_depth=1), log=lambda line: None, **SIZES)

@@ -22,7 +22,7 @@ class ScriptedTestDouble:
         parts = sections(request.prompt)
         if request.purpose == "forecast":
             stated = re.search(r"about (\d+)%", parts["SELF-MODEL"])
-            return stated.group(1) if stated else "80"
+            return f"{stated.group(1) if stated else 80}%"
         if request.purpose == "answer":
             match = re.search(r"Compute (\d+) \+ (\d+) \* (\d+)\. Return only the integer\.", parts["TASK"])
             if not match:

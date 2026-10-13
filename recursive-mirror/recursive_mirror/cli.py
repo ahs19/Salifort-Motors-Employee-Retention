@@ -55,6 +55,8 @@ def parser() -> argparse.ArgumentParser:
     experiment.add_argument("--validation", type=int, default=24)
     experiment.add_argument("--final", type=int, default=48)
     experiment.add_argument("--categories", type=_categories, default=CATEGORIES)
+    experiment.add_argument("--total-seconds", type=int, default=0,
+                            help="Wall-clock budget shared by all runs as it is spent (0 = none)")
     experiment.add_argument("--control-strategy", default=DEFAULT_CONTROL_STRATEGY,
                             help="Hand-written starting strategy for the control arm ('' disables it)")
     summary = commands.add_parser("summarize", help="Recompute the pooled summary of an experiment directory")
@@ -153,7 +155,8 @@ def main(argv: list[str] | None = None) -> int:
                                          validation=args.validation, final=args.final,
                                          categories=args.categories,
                                          control_strategy=args.control_strategy or None,
-                                         log=lambda line: print(line, flush=True))
+                                         log=lambda line: print(line, flush=True),
+                                         total_seconds=args.total_seconds)
                 completed = sum("final_n" in run for run in summary["runs"])
                 return 0 if completed == len(summary["runs"]) else 1
             plan = load_plan(args.plan)
@@ -172,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
                          "model_identity": result.model_identity,
                          "accepted_levels": sum(s.accepted for s in result.steps),
                          "transfer_improved": result.transfer_improved,
+                         "final_reason": result.final_comparison.reason,
                          "initial_final_metrics": asdict(result.initial_final_metrics),
                          "candidate_final_metrics": asdict(result.candidate_final_metrics),
                          "committed_state_sha256": result.committed_state.sha256,

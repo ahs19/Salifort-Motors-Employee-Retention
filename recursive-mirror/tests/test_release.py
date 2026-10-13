@@ -65,6 +65,10 @@ class ReleaseTests(unittest.TestCase):
         self.assertLess(gpu.index('captured("gpu-status"'), gpu.index('"pip", "install"'))
         self.assertLess(gpu.index('"pip", "install"'), gpu.index('"gpu-integration-test"'))
         self.assertIn('RECURSIVE_MIRROR_TEST_DEVICE="cuda"', gpu)
+        # Never import tests by dotted name: Colab has its own top-level "tests" package.
+        for source in sources:
+            self.assertNotIn('"tests.', source)
+        self.assertIn('"discover", "-s", "tests", "-p", "test_hf_integration.py"', " ".join(gpu.split()))
         self.assertIn('"--revision", REVISION, "--allow-download", "--device", "cuda"', gpu)
         self.assertIn("CAPABILITY[0] >= 8", gpu)
         # Software tests, then GPU check, then preflight, then the experiment, then export.
@@ -73,7 +77,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(order, sorted(order))
         self.assertEqual(order[-1], len(sources) - 1)
         experiment = sources[at('"experiment", "--output"')]
-        for flag in ('"--max-calls", str(MAX_CALLS_PER_RUN)', '"--max-seconds", str(PER_RUN_SECONDS)', "*MODEL_ARGS"):
+        for flag in ('"--max-calls", str(MAX_CALLS_PER_RUN)', '"--total-seconds", str(TOTAL_SECONDS)', "*MODEL_ARGS"):
             self.assertIn(flag, experiment)
         self.assertNotIn("raise", experiment)  # a failed run must still reach the export cell
 

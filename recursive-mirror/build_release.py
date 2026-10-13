@@ -144,6 +144,7 @@ general self-improvement, changed weights, or subjective awareness.
         ROUNDS, DISCOVERY, VALIDATION, FINAL = 3, 12, 24, 48   # larger validation/final sets = more power
         MAX_CALLS_PER_RUN = 720       # 3 levels need at most 711 calls with these sizes
         TOTAL_HOURS = 4.0             # wall-clock budget shared by all runs of the main experiment
+        FORCE_AFTER_WEAK_PREFLIGHT = False  # True: run the experiment even if the preflight looks uninformative
         print({"model": MODEL, "seeds": SEEDS, "control": RUN_CONTROL, "hours": TOTAL_HOURS})
     ''')
     code('''
@@ -248,8 +249,10 @@ in about a minute, before any long run.
                         "versions": {name: version(name) for name in ["torch", "transformers", "accelerate"]}}
         (SESSION / "runtime-info.json").write_text(json.dumps(runtime_info, indent=2), encoding="utf-8")
         print(json.dumps(runtime_info, indent=2))
-        captured("gpu-integration-test", [sys.executable, "-B", "-m", "unittest", "tests.test_hf_integration", "-v"],
-                 timeout=900, env=dict(ENV, RECURSIVE_MIRROR_TEST_DEVICE="cuda"))
+        # Load the test by file path: Colab ships an unrelated top-level package named tests,
+        # which shadows this project's tests folder when a test is imported by dotted name.
+        captured("gpu-integration-test", [sys.executable, "-B", "-m", "unittest", "discover", "-s", "tests",
+                 "-p", "test_hf_integration.py", "-v"], timeout=900, env=dict(ENV, RECURSIVE_MIRROR_TEST_DEVICE="cuda"))
         MODEL_ARGS = ["--model", MODEL, "--revision", REVISION, "--allow-download", "--device", "cuda",
                       "--dtype", DTYPE, "--batch-size", str(BATCH), "--max-input-tokens", "8192"]
     ''')
@@ -271,11 +274,21 @@ at all.
                         "--max-calls", "60"], timeout=3600)
         health = diagnose(PREFLIGHT)
         print(diagnosis_markdown(PREFLIGHT, health))
+        answers = sum(health["answer_status"].values()) or 1
         usable = sum(health["answer_status"].get(k, 0) for k in ("answer_line", "boxed", "last_line"))
-        if code != 0 or not usable:
-            raise RuntimeError("Preflight failed: the model did not complete the protocol. Run the last cell "
-                               "to export the evidence and send it to Claude.")
-        print("Preflight passed" + (" with warnings: " + "; ".join(health["warnings"]) if health["warnings"] else "."))
+        valid = health["forecasts"].get("valid", 0) / (sum(health["forecasts"].values()) or 1)
+        problems = []
+        if code != 0:
+            problems.append(f"the preflight run exited with code {code}")
+        if usable / answers < 0.5:
+            problems.append(f"only {usable}/{answers} answers were usable (the rest hit the token limit or were empty)")
+        if valid < 0.5:
+            problems.append(f"only {valid:.0%} of forecasts were valid percentages")
+        if problems and not FORCE_AFTER_WEAK_PREFLIGHT:
+            raise RuntimeError("Preflight looks uninformative: " + "; ".join(problems) + ". Run the last cell to "
+                               "export the evidence and send it to Claude (or set FORCE_AFTER_WEAK_PREFLIGHT).")
+        print("Preflight passed" + (" with warnings: " + "; ".join(health["warnings"] + problems)
+                                    if health["warnings"] or problems else "."))
     ''')
     markdown("""## The experiment\n
 Each run writes its own journal, result, checkpoint and `report.md`; a pooled
@@ -284,12 +297,11 @@ usable evidence. Progress lines appear below as levels complete.
 """)
     code('''
         EXPERIMENT = SESSION / "experiment"
-        RUNS = len([s for s in SEEDS.split(",") if s.strip()]) * (2 if RUN_CONTROL else 1)
-        PER_RUN_SECONDS = int(TOTAL_HOURS * 3600 / RUNS)
+        TOTAL_SECONDS = int(TOTAL_HOURS * 3600)  # shared out as it is spent: fast runs leave time for later ones
         command = [sys.executable, "-B", "-m", "recursive_mirror", "experiment", "--output", str(EXPERIMENT),
                    *MODEL_ARGS, "--seeds", SEEDS, "--rounds", str(ROUNDS), "--discovery", str(DISCOVERY),
                    "--validation", str(VALIDATION), "--final", str(FINAL), "--max-depth", str(ROUNDS),
-                   "--max-calls", str(MAX_CALLS_PER_RUN), "--max-seconds", str(PER_RUN_SECONDS)]
+                   "--max-calls", str(MAX_CALLS_PER_RUN), "--total-seconds", str(TOTAL_SECONDS)]
         if not RUN_CONTROL:
             command += ["--control-strategy", ""]
         code = streamed("experiment", command, timeout=int(TOTAL_HOURS * 3600) + 3600)

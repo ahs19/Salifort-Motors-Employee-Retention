@@ -56,9 +56,12 @@ class FakeModel:
 
     @staticmethod
     def improving_evaluation(request, parts):
+        """Strategy k solves the tasks of level k-1 and earlier; final tasks need any revision."""
         version = int(strategy_of(parts).removeprefix("strategy-"))
         if request.purpose == "answer":
-            return "Reasoning.\nANSWER: ok"
+            match = re.search(r"-(\d+)$", task_id(request) or "")
+            index = int(match.group(1)) if match and not task_id(request).startswith("final-") else 0
+            return "Reasoning.\nANSWER: ok" if version > index else "Reasoning.\nANSWER: no"
         return str([10, 50, 80, 100][min(version, 3)])
 
     def complete(self, request):
@@ -395,19 +398,22 @@ class EvidenceRegressionTests(unittest.TestCase):
 
     def test_forecast_that_is_the_task_answer_is_not_a_probability(self):
         # v0.8 trial 2: the forecast call returned "216", the answer to 27 x 8.
-        plan = Plan((Round((Task("d", "Count it.", "3"),), (Task("v", "Count that.", "2"),)),),
-                    (Task("f", "Count this.", "4"),))
+        plan = Plan((Round((Task("d", "Count it.", "3"), Task("w", "Count those.", "3")),
+                           (Task("v", "Count that.", "2"),)),),
+                    (Task("f", "Name the day.", "Sunday"),))
 
         def evaluation(req, parts):
             if req.purpose == "answer":
                 return "ANSWER: 3"
-            return {"Count it.": "3", "Count that.": "2%", "Count this.": "70"}[parts["TASK"].split("\n", 1)[1]]
+            return {"Count it.": "3", "Count those.": "5", "Count that.": "2%",
+                    "Name the day.": "70"}[parts["TASK"].split("\n", 1)[1]]
 
         result, _, _, _ = run_case(FakeModel(evaluation), plan)
         by_task = {o.task_id: o for o in result.committed_state.observations}
-        self.assertIsNone(by_task["d"].probability)          # bare "3" equals the answer key
-        self.assertEqual(by_task["v"].probability, 0.02)     # explicit percentage is a forecast
-        self.assertEqual(by_task["f"].probability, 0.7)
+        self.assertIsNone(by_task["d"].probability)          # bare "3" is the (correct) answer
+        self.assertIsNone(by_task["w"].probability)          # bare "5" may be a wrong answer: also invalid
+        self.assertEqual(by_task["v"].probability, 0.02)     # an explicit percentage is a forecast
+        self.assertEqual(by_task["f"].probability, 0.7)      # a bare number cannot be a weekday answer
 
     def test_wall_clock_budget_stops_recursion_but_keeps_the_final_test(self):
         engine = RecursiveMirror(FakeModel(), make_plan(3), C(max_seconds=1))
@@ -416,6 +422,28 @@ class EvidenceRegressionTests(unittest.TestCase):
         self.assertEqual(result.status, "time_budget")
         self.assertEqual(len(result.steps), 1)
         self.assertEqual(result.final_comparison.parent.n, 1)
+
+    def test_non_executable_screen_ignores_negated_sentences(self):
+        from recursive_mirror.core import non_executable
+        self.assertTrue(non_executable("Include a diverse set of problems in its training, then check."))
+        self.assertTrue(non_executable("Propose expanding the training dataset."))
+        self.assertFalse(non_executable("Do not rely on training data; multiply digit by digit."))
+        self.assertFalse(non_executable("Use a feedback loop: re-check each partial product."))
+
+    def test_untested_attempts_are_not_presented_as_rejected(self):
+        override = lambda req: "x" * 2401 if req.purpose == "revise_strategy:repair" else None  # noqa: E731
+        _, model, _, _ = run_case(FakeModel(override=override), make_plan(2), C(patience=3))
+        later = [r for r in model.requests if r.purpose == "perspective:actor"][1]
+        history = sections(later.prompt)["PREVIOUS IMPROVEMENT ATTEMPTS"]
+        self.assertIn("repair | NOT TESTED (strategy_too_long)", history)
+
+    def test_wall_clock_admission_reserves_the_level_and_the_final_at_the_measured_pace(self):
+        engine = RecursiveMirror(FakeModel(), make_plan(3), C(max_seconds=100))
+        # Level 0 is admitted at once; by level 1, 13 calls took 60 s (about 4.6 s per call), so a
+        # 13-call level plus the 4-call final would need about 78 s more and exceed 100 s.
+        with unittest.mock.patch("recursive_mirror.core.time.monotonic", side_effect=[0.0, 0.0, 60.0, 60.0]):
+            result = engine.run(INITIAL)
+        self.assertEqual((result.status, len(result.steps)), ("time_budget", 1))
 
     def test_parent_forecast_failure_cannot_create_candidate_calibration_gain(self):
         # v0.8 trial 2, level 1: the parent echoed "216" instead of a probability,
@@ -525,7 +553,7 @@ class BudgetAndAuditTests(unittest.TestCase):
         self.assertEqual(len(responses), 4)
         self.assertTrue(all(event["backend_receipt"] == receipt for event in responses))
         self.assertEqual([event["response"] for event in responses],
-                         ["10", "Reasoning.\nANSWER: ok", "10", "Reasoning.\nANSWER: ok"])
+                         ["10", "Reasoning.\nANSWER: no", "10", "Reasoning.\nANSWER: no"])
 
     def test_oversized_request_stops_before_backend_without_truncation(self):
         model, events = FakeModel(), []
@@ -752,11 +780,12 @@ class IsolationAndScoringTests(unittest.TestCase):
                 self.assertNotEqual(normalize_answer(left), normalize_answer(right))
 
     def test_forecast_parsing_accepts_only_one_integer_percentage(self):
-        valid = {"85": 0.85, " 100\n": 1.0, "0": 0.0, "7%": 0.07, " 64 % ": 0.64}
+        valid = {"85": 0.85, " 100\n": 1.0, "0": 0.0, "7%": 0.07, " 64 % ": 0.64, "**40%**": 0.4, "40%.": 0.4}
         for raw, probability in valid.items():
             with self.subTest(raw=raw):
                 self.assertEqual(parse_forecast(raw), probability)
-        for raw in ("216", "NaN", "0.5", "101", "-1", "050", "50 because likely", "", "85\n90"):
+        for raw in ("216", "NaN", "0.5", "101", "-1", "050", "50 because likely", "", "85\n90",
+                    "letter_count: 40%", "40% (1 of 2 correct so far)"):
             with self.subTest(raw=raw):
                 self.assertIsNone(parse_forecast(raw))
 
@@ -782,7 +811,8 @@ class IsolationAndScoringTests(unittest.TestCase):
         self.assertFalse(result.steps[0].accepted)
         comparison = result.steps[0].candidates[0].comparison
         self.assertEqual((comparison.candidate.accuracy, comparison.candidate.forecast_coverage), (1.0, 0.0))
-        self.assertEqual(comparison.reason, "calibration_regression")
+        # A strategy-only candidate is judged on answers; equal answers never pass, whatever the forecasts.
+        self.assertEqual(comparison.reason, "no_declared_gain")
         self.assertEqual(result.committed_state.strategy, INITIAL.strategy)
 
     def test_paired_gate_requires_gain_and_disallows_regressions(self):
@@ -801,8 +831,9 @@ class IsolationAndScoringTests(unittest.TestCase):
             (parent, rows([(0.5, True), (0.5, True), (None, True), (None, False)]), True, "accuracy_gain"),
             # but with accuracy unchanged, malformed forecasts count as the worst loss,
             (parent, rows([(0.5, True), (0.5, False), (None, True), (None, False)]), False, "calibration_regression"),
-            # and a calibration gain cannot come from dropping forecasts.
-            (overconfident, rows([(1.0, True), (0.0, False), (None, True), (0.0, False)]), False,
+            # a dropped forecast is allowed only when overall Brier (invalid = 1.0) also clearly falls,
+            (overconfident, rows([(1.0, True), (0.0, False), (None, True), (0.0, False)]), True, "calibration_gain"),
+            (parent, rows([(1.0, True), (0.0, False), (None, True), (0.0, False)]), False,
              "forecast_coverage_regression"),
             (overconfident, rows([(1.0, True), (0.0, False), (1.0, True), (0.0, False)]), True, "calibration_gain"),
         ]
@@ -812,6 +843,28 @@ class IsolationAndScoringTests(unittest.TestCase):
                 self.assertEqual((result.passed, result.reason), (passed, reason))
         with self.assertRaisesRegex(ValueError, "same tasks"):
             compare(parent, parent[::-1], cfg)
+
+    def test_gate_judges_each_changed_lever_where_it_acts(self):
+        cfg = Config()
+        initial = rows([(0.9, True)] * 8 + [(0.9, False)] * 8)
+        # Same answers, honest forecasts: a self-model change passes on calibration.
+        recalibrated = rows([(0.55, True)] * 8 + [(0.55, False)] * 8)
+        self.assertEqual(compare(initial, recalibrated, cfg, frozenset({"self_model"})).reason, "calibration_gain")
+        # A composite change with one extra (non-significant) correct answer must not lose that
+        # calibration gain: the gate is monotonic in accuracy (multi-agent review, high).
+        composite = rows([(0.55, True)] * 9 + [(0.55, False)] * 7)
+        result = compare(initial, composite, cfg, frozenset({"strategy", "self_model"}))
+        self.assertEqual((result.passed, result.reason), (True, "calibration_gain"))
+        # A strategy-only change is judged on answers: reshuffled answers with better-looking
+        # forecasts are not an improvement.
+        reshuffled = rows([(0.6, True)] * 6 + [(0.6, False)] * 2 + [(0.6, True)] * 2 + [(0.6, False)] * 6)
+        self.assertEqual(compare(initial, reshuffled, cfg, frozenset({"strategy"})).reason, "no_declared_gain")
+        # One malformed forecast out of 24 does not veto a clear calibration gain.
+        base = rows([(0.9, True)] * 12 + [(0.9, False)] * 12)
+        echoed = rows([(0.5, True)] * 12 + [(0.5, False)] * 11 + [(None, False)])
+        self.assertEqual(compare(base, echoed, cfg, frozenset({"self_model"})).reason, "calibration_gain")
+        # Identical policies cannot pass.
+        self.assertEqual(compare(base, base, cfg, frozenset()).reason, "no_declared_gain")
 
     def test_evidence_gate_needs_consistent_per_task_gains(self):
         cfg = Config()  # max_p_value = 0.25

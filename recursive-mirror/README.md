@@ -70,9 +70,10 @@ found:
   veto a real accuracy gain. Now `repair` and `rewrite` change only the
   strategy and are judged on answers. `recalibrate` changes only the
   self-model and is judged on forecasts.
-- **Forecasts that are task answers.** A forecast equal to the task's answer
-  (v0.8 answered "216" when asked for a probability) is now invalid.
-  Forecasts are requested as percentages.
+- **Forecasts that are task answers.** v0.8 answered "216" when asked for a
+  probability. On integer-answer tasks a bare number may be the task's answer,
+  right or wrong, so only an explicit "NN%" counts there, identically for
+  every arm. `diagnose` reports forecast formats.
 - **Answer extraction** now handles Qwen's habits (`<…>`, `$…$`, `\boxed{}`, a
   trailing "answer:"). The same format-only rules apply to every arm.
 - **Prompt hygiene.** Hashes, backend identities and budgets are no longer
@@ -117,18 +118,24 @@ found:
    validation request. The parent and each candidate run on the same fresh
    validation tasks with paired seeds. Validation answer keys never reach
    the model.
-5. **Select (`core.compare`).** Accuracy is the primary objective.
-   - Accuracy may never fall.
-   - An accuracy gain passes when it is at least `min_accuracy_gain` and its
-     one-sided paired p-value across tasks is at most `max_p_value` (default
-     0.25).
-   - Otherwise a calibration gain passes when all of these hold: the Brier
-     loss falls on tasks where *both* arms forecast validly, with the same
-     p-value bound; forecast coverage does not drop; and overall Brier does
-     not rise (an invalid forecast counts as the worst loss).
+5. **Select (`core.compare`).** Each changed text is judged where it acts,
+   and accuracy may never fall.
+   - **Accuracy route** (when the strategy changed): the gain must be at
+     least `min_accuracy_gain`, with a one-sided paired p-value across tasks
+     of at most `max_p_value` (default 0.25).
+   - **Calibration route** (when the self-model changed): Brier loss must fall
+     on tasks where *both* arms forecast validly, with the same p-value bound,
+     and overall Brier must not rise (an invalid forecast counts as the worst
+     loss). A drop in forecast coverage is allowed only if that overall Brier
+     itself clearly falls.
+   - A strategy-only proposal is therefore never accepted for nicer-looking
+     forecasts.
+   - A composite change, as in the final test, may pass on either route. A
+     non-significant accuracy change never blocks a real calibration gain.
 
    The best passing candidate becomes the next state. Every candidate enters
-   the attempt ledger.
+   the attempt ledger. Untested proposals are shown to later levels as
+   "NOT TESTED", not as rejected.
 6. **Recurse.** `_recurse(next_state, level + 1, …)` is called directly. It
    stops at the depth limit, the call or time budget (the final test is
    always reserved), the end of the plan, or after `patience` levels without

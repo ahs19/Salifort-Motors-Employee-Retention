@@ -17,9 +17,10 @@ any selection decision:
 """
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
+import time
 import traceback
 from typing import Callable
 
@@ -37,8 +38,13 @@ SUMMARY_FORMAT = "recursive-mirror-experiment-summary-v1"
 def run_experiment(model: LanguageModel, output: str | Path, *, seeds: tuple[int, ...], config: Config,
                    rounds: int = 3, discovery: int = 12, validation: int = 24, final: int = 48,
                    categories: tuple[str, ...] = CATEGORIES, control_strategy: str | None = DEFAULT_CONTROL_STRATEGY,
-                   log: Callable[[str], None] = print) -> dict:
-    """Run every seed (and control) in order; one failed run never discards the others."""
+                   log: Callable[[str], None] = print, total_seconds: int = 0) -> dict:
+    """Run every seed (and control) in order; one failed run never discards the others.
+
+    total_seconds, when set, is shared out as it is spent: each run gets the
+    remaining time divided by the runs still to come, so time a fast run saves
+    carries over and a slow run cannot push the last run past the deadline.
+    """
     if not seeds or len(set(seeds)) != len(seeds):
         raise ValueError("seeds must be a nonempty list of distinct integers")
     root = Path(output)
@@ -49,6 +55,7 @@ def run_experiment(model: LanguageModel, output: str | Path, *, seeds: tuple[int
                  "categories": list(categories)},
         "control_strategy": control_strategy, "config": asdict(config)})
     arms = [("self", None)] + ([("control", State(strategy=control_strategy))] if control_strategy else [])
+    started, runs_left = time.monotonic(), len(seeds) * len(arms)
     for seed in seeds:
         plan = generate_plan(seed, rounds, discovery, validation, final, categories)
         for arm, initial in arms:
@@ -61,8 +68,13 @@ def run_experiment(model: LanguageModel, output: str | Path, *, seeds: tuple[int
                     log(f"[seed {seed} | {arm}] level {event['round_index']}: selected {chosen}; "
                         + ", ".join(f"{c['kind']}={c['reason']}" for c in event["candidates"]))
 
+            run_config = config
+            if total_seconds:
+                share = int((total_seconds - (time.monotonic() - started)) / runs_left)
+                run_config = replace(config, max_seconds=max(60, share))
+            runs_left -= 1
             try:
-                result = execute(model, plan, directory, config, initial, on_event=progress)
+                result = execute(model, plan, directory, run_config, initial, on_event=progress)
                 final_cmp = result.final_comparison
                 health = diagnose(directory)
                 log(f"[seed {seed} | {arm}] done: final accuracy {final_cmp.parent.accuracy:.0%} -> "
@@ -84,23 +96,32 @@ def _final_rows(result: dict, phase: str) -> dict[str, dict]:
 
 
 def _paired(left: dict[str, dict], right: dict[str, dict]) -> dict:
-    """Paired comparison of right over left on shared task IDs (accuracy and Brier)."""
+    """Paired comparison of right over left on shared task IDs.
+
+    Calibration is measured the way the gate measures it: Brier loss only on
+    tasks where both sides produced a valid forecast, with forecast coverage
+    reported separately, so a missing forecast can never pose as a gain.
+    """
     ids = sorted(left.keys() & right.keys())
     if not ids:
         return {"n": 0}
 
-    def brier(row):
-        return 1.0 if row["probability"] is None else (row["probability"] - int(row["correct"])) ** 2
+    def loss(row):
+        return (row["probability"] - int(row["correct"])) ** 2
 
+    both = [i for i in ids if left[i]["probability"] is not None and right[i]["probability"] is not None]
     acc_l = sum(left[i]["correct"] for i in ids) / len(ids)
     acc_r = sum(right[i]["correct"] for i in ids) / len(ids)
     wins = sum(right[i]["correct"] and not left[i]["correct"] for i in ids)
     losses = sum(left[i]["correct"] and not right[i]["correct"] for i in ids)
     return {"n": len(ids), "accuracy_before": acc_l, "accuracy_after": acc_r, "wins": wins, "losses": losses,
             "accuracy_p": paired_p_value([int(right[i]["correct"]) - int(left[i]["correct"]) for i in ids]),
-            "brier_before": sum(brier(left[i]) for i in ids) / len(ids),
-            "brier_after": sum(brier(right[i]) for i in ids) / len(ids),
-            "brier_p": paired_p_value([brier(left[i]) - brier(right[i]) for i in ids])}
+            "coverage_before": sum(left[i]["probability"] is not None for i in ids) / len(ids),
+            "coverage_after": sum(right[i]["probability"] is not None for i in ids) / len(ids),
+            "paired_forecasts": len(both),
+            "brier_before": sum(loss(left[i]) for i in both) / len(both) if both else None,
+            "brier_after": sum(loss(right[i]) for i in both) / len(both) if both else None,
+            "brier_p": paired_p_value([loss(left[i]) - loss(right[i]) for i in both])}
 
 
 def summarize(root: str | Path) -> dict:
@@ -195,16 +216,18 @@ def summary_markdown(summary: dict) -> str:
               "self_vs_control": "Self-improved policy vs hand-written step-by-step prompt",
               "control_self_improvement": "Selected policy vs the hand-written starting prompt (control arm)"}
     lines += ["", "## Pooled held-out comparisons", "",
-              "| comparison | tasks | accuracy | wins/losses | p (accuracy) | Brier | p (Brier) |",
-              "|---|---|---|---|---|---|---|"]
+              "| comparison | tasks | accuracy | wins/losses | p (accuracy) | forecast coverage | "
+              "Brier on paired valid forecasts | p (Brier) |", "|---|---|---|---|---|---|---|---|"]
     for key, title in titles.items():
         p = summary["pooled"][key]
         if not p.get("n"):
-            lines.append(f"| {title} | 0 | | | | | |")
+            lines.append(f"| {title} | 0 | | | | | | |")
             continue
+        brier = ("n/a" if p["brier_before"] is None else
+                 f"{p['brier_before']:.3f} -> {p['brier_after']:.3f} (n={p['paired_forecasts']})")
         lines.append(f"| {title} | {p['n']} | {_pct(p['accuracy_before'])} -> {_pct(p['accuracy_after'])} | "
-                     f"{p['wins']}/{p['losses']} | {p['accuracy_p']:.3f} | {p['brier_before']:.3f} -> "
-                     f"{p['brier_after']:.3f} | {p['brier_p']:.3f} |")
+                     f"{p['wins']}/{p['losses']} | {p['accuracy_p']:.3f} | {_pct(p['coverage_before'])} -> "
+                     f"{_pct(p['coverage_after'])} | {brier} | {p['brier_p']:.3f} |")
     if summary.get("categories"):
         lines += ["", "## Held-out accuracy by task type (self arm, pooled)", "",
                   "| task type | n | initial | selected |", "|---|---|---|---|"]

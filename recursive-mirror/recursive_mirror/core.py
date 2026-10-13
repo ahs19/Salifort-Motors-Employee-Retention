@@ -104,13 +104,25 @@ def _clean(text: str) -> str:
     return text
 
 
-_FORECAST = re.compile(r"\s*(100|[1-9]?\d)\s*%?\s*")
+_FORECAST = re.compile(r"(100|[1-9]?\d)\s*%?")
 
 
 def parse_forecast(raw: str) -> float | None:
-    """One integer 0..100, optionally followed by '%'. Anything else is invalid, never repaired."""
-    match = _FORECAST.fullmatch(raw)
+    """One integer 0..100, optionally followed by '%'. Anything else is invalid, never repaired.
+
+    Only format is tolerated: surrounding whitespace, quotes or markdown emphasis
+    and one trailing full stop ("**40%**", "40%."). Labels or explanations
+    ("letter_count: 40%", "40% (2 of 5)") stay invalid.
+    """
+    text = raw.strip().strip("*_`'\"").strip()
+    if text.endswith(".") and not text.endswith(".."):
+        text = text[:-1].rstrip()
+    match = _FORECAST.fullmatch(text)
     return int(match.group(1)) / 100 if match else None
+
+
+def _is_integer_answer(expected: str) -> bool:
+    return re.fullmatch(r"-?\d+", normalize_answer(expected)) is not None
 
 
 def render(sections: list[tuple[str, str]]) -> str:
@@ -413,20 +425,33 @@ class Comparison:
     reason: str
 
 
-def compare(parent: tuple[Observation, ...], candidate: tuple[Observation, ...], cfg: Config) -> Comparison:
-    """Engineering gate with accuracy as the primary objective.
+BOTH_LEVERS = frozenset({"strategy", "self_model"})
+
+
+def changed_levers(before: State, after: State) -> frozenset[str]:
+    """Which of the two texts differ between two policies."""
+    return frozenset(name for name, a, b in (("strategy", before.strategy, after.strategy),
+                                             ("self_model", before.self_model, after.self_model)) if a != b)
+
+
+def compare(parent: tuple[Observation, ...], candidate: tuple[Observation, ...], cfg: Config,
+            levers: frozenset[str] = BOTH_LEVERS) -> Comparison:
+    """Engineering gate: each changed lever is judged where it acts.
 
     - Accuracy may never fall.
-    - An accuracy gain of at least min_accuracy_gain with a paired one-sided
-      p-value of at most max_p_value passes, whatever the forecasts did: a new
-      strategy is forecast with the parent's self-model, which describes the old
-      strategy, so its calibration is judged later by a recalibrate proposal.
-      Malformed forecasts cannot raise accuracy, so they cannot game this path.
-    - Otherwise a calibration gain passes: Brier loss falls by min_brier_gain
-      on tasks where both arms forecast validly, with the same p-value bound,
-      no loss of forecast coverage and no rise in overall Brier (an invalid
-      forecast counts as the worst loss). A parent's malformed forecast thus
+    - Accuracy route (allowed when the strategy changed): a gain of at least
+      min_accuracy_gain with a paired one-sided p-value of at most max_p_value
+      passes, whatever the forecasts did. A new strategy is forecast with a
+      self-model written for the old one, so calibration is judged later.
+    - Calibration route (allowed when the self-model changed): Brier loss
+      falls by min_brier_gain on tasks where both arms forecast validly, with
+      the same p-value bound, and overall Brier (an invalid forecast counts as
+      the worst loss) does not rise. A loss of forecast coverage is allowed only
+      if that overall Brier itself falls by min_brier_gain, so dropping
+      forecasts can never manufacture a gain, and a parent's malformed forecast
       cannot pose as the candidate's gain (the v0.8 Colab trial accepted one).
+    - A composite change (both levers, as in the final test) may pass on either
+      route; a non-significant accuracy change never blocks the calibration route.
     These are exploratory gates without multiplicity correction.
     """
     if [o.task_id for o in parent] != [o.task_id for o in candidate]:
@@ -447,24 +472,28 @@ def compare(parent: tuple[Observation, ...], candidate: tuple[Observation, ...],
     accuracy_p = paired_p_value([int(b.correct) - int(a.correct) for a, b in zip(parent, candidate)])
     calibration_p = paired_p_value([loss(a) - loss(b) for a, b in pairs])
     eps = 1e-12
-    accuracy_gain = c.accuracy - p.accuracy + eps >= cfg.min_accuracy_gain
-    calibration_gain = bool(pairs) and p_brier - c_brier + eps >= cfg.min_brier_gain
+    accuracy_gain = "strategy" in levers and c.accuracy - p.accuracy + eps >= cfg.min_accuracy_gain
+    calibration_gain = ("self_model" in levers and bool(pairs)
+                        and p_brier - c_brier + eps >= cfg.min_brier_gain)
+    blocked = None
     if c.accuracy + eps < p.accuracy:
         passed, reason = False, "accuracy_regression"
     elif accuracy_gain and accuracy_p <= cfg.max_p_value + eps:
         passed, reason = True, "accuracy_gain"
-    elif accuracy_gain:
-        passed, reason = False, "gain_not_consistent"
-    elif c.brier > p.brier + eps:
-        passed, reason = False, "calibration_regression"
-    elif c.forecast_coverage + eps < p.forecast_coverage:
-        passed, reason = False, "forecast_coverage_regression"
-    elif calibration_gain and calibration_p <= cfg.max_p_value + eps:
-        passed, reason = True, "calibration_gain"
-    elif calibration_gain:
-        passed, reason = False, "gain_not_consistent"
     else:
-        passed, reason = False, "no_declared_gain"
+        if "self_model" in levers:
+            if c.brier > p.brier + eps:
+                blocked = "calibration_regression"
+            elif c.forecast_coverage + eps < p.forecast_coverage and p.brier - c.brier + eps < cfg.min_brier_gain:
+                blocked = "forecast_coverage_regression"
+            elif calibration_gain and calibration_p > cfg.max_p_value + eps:
+                blocked = "gain_not_consistent"
+        if calibration_gain and blocked is None:
+            passed, reason = True, "calibration_gain"
+        elif accuracy_gain:
+            passed, reason = False, "gain_not_consistent"
+        else:
+            passed, reason = False, blocked or "no_declared_gain"
     return Comparison(p, c, wins, losses, len(pairs), p_brier, c_brier,
                       accuracy_p, calibration_p, passed, reason)
 
@@ -516,8 +545,14 @@ class Result:
 
 MAX_REPLY_EXCERPTS = 4  # bounded reflection context: reasoning shown for at most four misses
 REPLY_EXCERPT_CHARS = 1500
-NON_EXECUTABLE = re.compile(r"\b(fine-?tun\w*|training (?:data|dataset|set)|retrain\w*|feedback loop)\b",
-                            re.IGNORECASE)
+NON_EXECUTABLE = re.compile(r"\b(fine-?tun\w*|training|retrain\w*|datasets?)\b", re.IGNORECASE)
+NEGATION = re.compile(r"\b(not|never|no|without|don't|cannot|can't|avoid)\b", re.IGNORECASE)
+
+
+def non_executable(strategy: str) -> bool:
+    """True if an affirmative sentence asks for training, fine-tuning or datasets."""
+    sentences = re.split(r"(?<=[.!?;])\s+|\n+", strategy)
+    return any(NON_EXECUTABLE.search(part) and not NEGATION.search(part) for part in sentences)
 
 LEVERS = ("Only two texts can change. STRATEGY is inserted verbatim as the agent's working "
           "instructions before every future task. SELF-MODEL is shown to the agent only when it "
@@ -745,10 +780,10 @@ class RecursiveMirror:
         rows, replies = [], {}
         for task, forecast, answer in zip(tasks, forecasts, answers):
             probability = parse_forecast(forecast.text) if forecast.usable else None
-            if (probability is not None and "%" not in forecast.text
-                    and normalize_answer(forecast.text) == normalize_answer(self._expected[task.task_id])):
-                # The forecast call answered the task instead (v0.8 gave "216" for 27 x 8).
-                # Scored with the evaluator's key, which never leaves the harness.
+            if probability is not None and "%" not in forecast.text and _is_integer_answer(self._expected[task.task_id]):
+                # On integer-answer tasks a bare number may be the task's answer, right or
+                # wrong (v0.8 gave "216" for 27 x 8), so only "NN%" counts. The rule is the
+                # same for every arm and does not depend on whether the leak was correct.
                 probability = None
             if answer.usable:
                 value, method = extract_answer(answer.text)
@@ -826,7 +861,8 @@ class RecursiveMirror:
                  "proposer never saw:"]
         for a in shown:
             where = "final held-out test" if a.round_index < 0 else f"level {a.round_index}"
-            head = f"- {where} | {a.kind} | {a.outcome.upper()} ({a.reason})"
+            label = "NOT TESTED" if a.outcome == "ineligible" else a.outcome.upper()
+            head = f"- {where} | {a.kind} | {label} ({a.reason})"
             if a.candidate_accuracy is not None:
                 head += (f" | accuracy {_percent(a.parent_accuracy)} -> {_percent(a.candidate_accuracy)}"
                          f" on {a.n} tasks")
@@ -880,7 +916,7 @@ class RecursiveMirror:
             return text, f"{label}_{reply.status}"
         if len(text) > self.config.max_policy_chars:
             return text, f"{label}_too_long"
-        if label == "strategy" and NON_EXECUTABLE.search(text):
+        if label == "strategy" and non_executable(text):
             # Advice about training or feedback loops cannot be carried out at inference time
             # (the v0.8 trial's proposals); screen it before spending validation calls.
             return text, "strategy_non_executable"
@@ -903,8 +939,9 @@ class RecursiveMirror:
                 "You revise an AI agent's SELF-MODEL: notes shown to the agent only when it estimates, "
                 "before answering, how likely it is to answer a task exactly right. Write the complete "
                 "new self-model for an agent that will keep using the STRATEGY below. Write one line "
-                "per task type in the form '<task type>: NN% (k of n correct so far)', guided by the "
-                "smoothed estimates; stay between 20% and 80% for task types with fewer than 5 results. "
+                "per task type in the form '<task type>: about N in 10 correct (k of n so far)', guided "
+                "by the smoothed estimates; stay between 2 and 8 in 10 for task types with fewer than 5 "
+                "results. "
                 "Then add at most two sentences on what is untested. Do not claim or deny awareness. "
                 "Output only the self-model text.",
                 context + [("STRATEGY THE AGENT WILL KEEP", state.strategy)], f"round:{index}:{kind}:self_model")
@@ -949,9 +986,13 @@ class RecursiveMirror:
         current = self.plan.rounds[index]
         if self.config.max_calls - self.calls - self._final_reserve < self._round_cost(current):
             return state, "call_budget"
-        if self.config.max_seconds and time.monotonic() - self._started >= self.config.max_seconds:
-            # Wall-clock limit: stop recursing, but still run the final comparison.
-            return state, "time_budget"
+        if self.config.max_seconds:
+            # Wall-clock limit: admit a level only if it and the reserved final comparison
+            # fit at the pace measured so far; the final comparison always runs.
+            elapsed = time.monotonic() - self._started
+            pace = elapsed / self.calls if self.calls else 0.0
+            if elapsed + pace * (self._round_cost(current) + self._final_reserve) > self.config.max_seconds:
+                return state, "time_budget"
         self.emit({"event": "recursive_enter", "round_index": index, "state_sha256": state.sha256,
                    "remaining_calls": self.config.max_calls - self.calls})
         discovery, replies = self._evaluate(state, current.discovery, index, "discovery")
@@ -982,7 +1023,7 @@ class RecursiveMirror:
                 continue
             rows, _ = self._evaluate(candidate, current.validation, index, "validation_candidate", kind)
             new_rows.extend(rows)
-            comparison = compare(parent_rows, rows, self.config)
+            comparison = compare(parent_rows, rows, self.config, changed_levers(state, candidate))
             results.append(CandidateResult(kind, strategy, self_model, True, comparison.reason,
                                            candidate.sha256, comparison))
             if comparison.passed:
@@ -1037,7 +1078,7 @@ class RecursiveMirror:
             self.emit({"event": "final_test_started", "candidate_state_sha256": candidate.sha256})
             before, _ = self._evaluate(initial, self.plan.final_tasks, -1, "final_initial")
             after, _ = self._evaluate(candidate, self.plan.final_tasks, -1, "final_candidate")
-            final = compare(before, after, self.config)
+            final = compare(before, after, self.config, changed_levers(initial, candidate))
             changed = candidate.policy_sha256 != initial.policy_sha256
             transfer = final.passed and changed
             attempts = candidate.attempts

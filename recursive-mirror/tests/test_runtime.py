@@ -395,6 +395,27 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("scripted-test-double", stdout.getvalue())
         self.assertIn("FileExistsError", stderr.getvalue())
 
+    def test_diagnose_reports_forecast_formats(self):
+        from recursive_mirror.diagnostics import diagnose
+        output = self.root / "diag"
+        execute(ScriptedTestDouble(), demo_plan(), output, Config(max_depth=2, max_calls=200))
+        report = diagnose(output)
+        self.assertEqual(report["forecast_formats"], {"percent": sum(report["forecasts"].values())})
+        self.assertFalse(any("NN%" in w for w in report["warnings"]))
+        lines = (output / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+        noisy = self.root / "noisy"
+        noisy.mkdir()
+        rewritten = []
+        for line in lines:
+            event = json.loads(line)
+            if event["event"] == "observation":
+                event["forecast_raw"] = {"0": "gibberish ending in %", "1": "85"}.get(str(len(rewritten) % 2), "85")
+            rewritten.append(json.dumps(event))
+        (noisy / "journal.jsonl").write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+        formats = diagnose(noisy)["forecast_formats"]
+        self.assertEqual(formats.get("percent", 0), 0)
+        self.assertGreater(formats["other"], 0)
+
     def test_report_names_each_outcome_honestly(self):
         result = demo_result()
         no_level = replace(result, steps=(), status="call_budget", transfer_improved=False)

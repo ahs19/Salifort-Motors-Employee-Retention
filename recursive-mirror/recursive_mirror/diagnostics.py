@@ -5,6 +5,8 @@ from collections import Counter
 import json
 from pathlib import Path
 
+from .core import parse_forecast
+
 
 def diagnose(run_dir: str | Path) -> dict:
     """Counts that show whether the model followed the protocol, and how fast it ran."""
@@ -13,7 +15,7 @@ def diagnose(run_dir: str | Path) -> dict:
     outcome = Counter()
     truncated = Counter()
     tokens = Counter()
-    answers, forecasts, accuracy = Counter(), Counter(), {}
+    answers, forecasts, formats, accuracy = Counter(), Counter(), Counter(), {}
     elapsed, batch_sizes, events = 0.0, Counter(), Counter()
     for line in path.read_text(encoding="utf-8").splitlines():
         try:
@@ -37,6 +39,9 @@ def diagnose(run_dir: str | Path) -> dict:
         elif kind == "observation":
             answers[event["answer_status"]] += 1
             forecasts["valid" if event["probability"] is not None else "invalid"] += 1
+            raw = event["forecast_raw"]
+            parsed = parse_forecast(raw) is not None
+            formats["percent" if parsed and "%" in raw else "bare_number" if parsed else "other"] += 1
             key = (event["phase"], event["category"])
             hit = accuracy.setdefault(key, [0, 0])
             hit[0] += 1
@@ -45,14 +50,20 @@ def diagnose(run_dir: str | Path) -> dict:
     return {"events": dict(events), "elapsed_seconds": round(elapsed, 1),
             "output_tokens": dict(tokens), "tokens_per_second": round(total_tokens / elapsed, 2) if elapsed else None,
             "calls_by_purpose": dict(outcome), "truncated_by_purpose": dict(truncated),
-            "answer_status": dict(answers), "forecasts": dict(forecasts), "batch_sizes": dict(batch_sizes),
+            "answer_status": dict(answers), "forecasts": dict(forecasts), "forecast_formats": dict(formats),
+            "batch_sizes": dict(batch_sizes),
             "accuracy": {f"{phase}/{category}": {"n": n, "correct": c}
                          for (phase, category), (n, c) in sorted(accuracy.items())},
-            "warnings": _warnings(outcome, truncated, answers, forecasts)}
+            "warnings": _warnings(outcome, truncated, answers, forecasts, formats)}
 
 
-def _warnings(outcome: Counter, truncated: Counter, answers: Counter, forecasts: Counter) -> list[str]:
+def _warnings(outcome: Counter, truncated: Counter, answers: Counter, forecasts: Counter,
+              formats: Counter) -> list[str]:
     notes = []
+    total_formats = sum(formats.values())
+    if total_formats and formats["percent"] / total_formats < 0.95:
+        notes.append(f"only {formats['percent']}/{total_formats} forecasts used the requested 'NN%' form "
+                     "(bare numbers are invalid on integer-answer tasks)")
     for purpose, n in outcome.items():
         if n and truncated[purpose] / n > 0.25:
             notes.append(f"{truncated[purpose]}/{n} {purpose} replies hit the token limit")
@@ -72,7 +83,7 @@ def diagnosis_markdown(run_dir: str | Path, report: dict) -> str:
              f"- Truncated by purpose: {report['truncated_by_purpose'] or 'none'}",
              f"- Output tokens by purpose: {report['output_tokens']}",
              f"- Answer extraction: {report['answer_status']}",
-             f"- Forecasts: {report['forecasts']}",
+             f"- Forecasts: {report['forecasts']}; formats: {report['forecast_formats']}",
              f"- Batch sizes (requests): {report['batch_sizes']}", "",
              "| phase/category | n | correct |", "|---|---|---|"]
     lines += [f"| {key} | {row['n']} | {row['correct']} |" for key, row in report["accuracy"].items()]
