@@ -19,7 +19,7 @@ import time
 from typing import Callable, Protocol
 
 
-PROTOCOL = "recursive-mirror-v0.10.0"
+PROTOCOL = "recursive-mirror-v0.11.0"
 
 
 def canonical(value: object) -> str:
@@ -319,7 +319,7 @@ class Config:
     min_accuracy_gain: float = 0.01
     min_brier_gain: float = 0.01
     max_p_value: float = 0.25
-    candidate_kinds: tuple[str, ...] = ("repair", "recalibrate")
+    candidate_kinds: tuple[str, ...] = ("add_rule", "add_rule_2", "recalibrate")
     reveal_discovery_answers: bool = True
     forecast_tokens: int = 16
     answer_tokens: int = 512
@@ -588,6 +588,37 @@ PERSPECTIVE_BRIEFS = {
                      "the most valuable single change to the strategy or the self-model."),
 }
 
+ECHOED_CONTEXT = re.compile(r"===|reference answer", re.IGNORECASE)
+OFF_LEVER_RULE = re.compile(r"forecast|confiden|probabilit|self-model", re.IGNORECASE)
+_RULE_LABEL = re.compile(r"^(?:(?:new\s+)?rule\s*\d*\s*[:.)-]|[-*\u2022]|\d+[.)])\s*", re.IGNORECASE)
+
+
+def extract_rule(reply: str) -> str:
+    """The first nonblank line of a rule proposal, without list markers, labels or quotes."""
+    for line in reply.splitlines():
+        line = _RULE_LABEL.sub("", line.strip().strip("*_`\"' ")).strip().strip("*_`\"' ")
+        if line:
+            return line
+    return ""
+
+
+def extract_self_model_lines(reply: str, categories: set[str]) -> str:
+    """Keep only the first '<task type>: ...' line per known task type.
+
+    A small model tends to continue a self-model by copying the evidence it was
+    shown (seen in the v0.10 A100 run); those lines are dropped, never rewritten.
+    """
+    kept, seen = [], set()
+    for line in reply.splitlines():
+        clean = line.strip().lstrip("-*\u2022 ").strip()
+        match = re.match(r"([A-Za-z][A-Za-z_ -]*?)\s*:", clean)
+        name = match.group(1).strip().lower().replace(" ", "_") if match else None
+        if name in categories and name not in seen:
+            seen.add(name)
+            kept.append(clean)
+    return "\n".join(kept)
+
+
 PROPOSAL_BRIEFS = {
     "repair": ("Write the complete new STRATEGY as direct, imperative working instructions. For each "
                "task type with errors, give a concrete procedure that would have produced the "
@@ -625,7 +656,8 @@ class RecursiveMirror:
     changed by the model. Use a new instance per run.
     """
     ANGLES = ("actor", "reviewer", "whole_system")
-    KINDS = ("repair", "rewrite", "recalibrate")
+    KINDS = ("repair", "rewrite", "recalibrate", "add_rule", "add_rule_2")
+    RULE_TARGETS = {"add_rule": 0, "add_rule_2": 1}  # rank of the weakest task type each kind targets
 
     def __init__(self, model: LanguageModel, plan: Plan, config: Config | None = None,
                  emit: Callable[[dict], None] | None = None):
@@ -916,19 +948,65 @@ class RecursiveMirror:
             return text, f"{label}_{reply.status}"
         if len(text) > self.config.max_policy_chars:
             return text, f"{label}_too_long"
+        if label == "strategy" and ECHOED_CONTEXT.search(text):
+            return text, "strategy_echoes_context"
         if label == "strategy" and non_executable(text):
             # Advice about training or feedback loops cannot be carried out at inference time
             # (the v0.8 trial's proposals); screen it before spending validation calls.
             return text, "strategy_non_executable"
         return text, None
 
+    def _current_policy_counts(self, state: State, discovery: tuple[Observation, ...]) -> dict[str, list[int]]:
+        counts: dict[str, list[int]] = {}
+        for row in (*state.observations, *discovery):
+            if row.policy_sha256 == state.policy_sha256:
+                entry = counts.setdefault(row.category, [0, 0])
+                entry[0] += 1
+                entry[1] += int(row.correct)
+        return counts
+
+    def _rule_context(self, state: State, index: int, discovery: tuple[Observation, ...],
+                      replies: dict[str, Reply], views: tuple[Perspective, ...],
+                      target: str, counts: dict[str, list[int]]) -> list[tuple[str, str]]:
+        """A short, focused context: a 3B proposer copies whatever long context it is given."""
+        n, correct = counts[target]
+        tasks = {t.task_id: t for r in self.plan.rounds for t in r.discovery}
+        misses = [o for o in (*discovery, *reversed(state.observations))
+                  if o.phase == "discovery" and o.category == target and not o.correct and o.task_id in tasks]
+        lines = []
+        for row in misses[:3]:
+            task = tasks[row.task_id]
+            lines.append(f"Task: {task.prompt}\nAgent's final answer: {row.answer or '(none)'}")
+            if self.config.reveal_discovery_answers:
+                lines.append(f"Correct answer: {task.expected}")
+            reply = replies.get(row.task_id)
+            if reply is not None and reply.text.strip():
+                lines.append(f"Agent's working (excerpt): {excerpt(reply.text, 700)}")
+        tried = [a for a in state.attempts if a.kind in self.RULE_TARGETS and a.strategy.strip()][-4:]
+        history = "\n".join(
+            f"- {a.strategy.strip().splitlines()[-1].lstrip('- ').strip()} -> "
+            f"{'NOT TESTED' if a.outcome == 'ineligible' else a.outcome.upper()} ({a.reason})" for a in tried)
+        actor = next((v.text for v in views if v.angle == "actor" and v.text.strip()), "")
+        return [("FRAME", f"Level {index + 1} of at most {self.config.max_depth}. Add one rule that "
+                          "improves the agent's weakest task type."),
+                ("WHAT CAN CHANGE", LEVERS),
+                ("CURRENT STRATEGY", state.strategy),
+                ("TARGET TASK TYPE", f"{target}: {correct} of {n} correct so far with the current strategy."),
+                ("MISSED EXAMPLES OF THIS TASK TYPE", "\n\n".join(lines) or "(no misses recorded yet)"),
+                ("RULES ALREADY TRIED", history or "(none yet)"),
+                ("THE AGENT'S OWN VIEW OF ITS MISSES (excerpt)", excerpt(actor, 500) or "(none)")]
+
     def _propose(self, state: State, evidence: list[tuple[str, str]], views: tuple[Perspective, ...],
-                 index: int, kind: str) -> tuple[str, str, str | None]:
+                 index: int, kind: str, discovery: tuple[Observation, ...] = (),
+                 replies: dict[str, Reply] | None = None) -> tuple[str, str, str | None]:
         """Return (strategy, self_model, ineligibility reason or None).
 
-        Each kind moves one lever, so each is judged where it acts: repair and
-        rewrite change only the strategy (judged on answers); recalibrate changes
-        only the self-model (judged on forecasts, with identical answers).
+        Each kind moves one lever, so each is judged where it acts:
+        - add_rule / add_rule_2 append one rule for the weakest / second-weakest
+          task type to the current strategy, so what already works is kept
+          (whole rewrites by the 3B model discarded it in the v0.10 A100 run);
+        - repair / rewrite replace the whole strategy;
+        - recalibrate changes only the self-model (judged on forecasts).
         """
         cfg = self.config
         context = evidence + [("PERSPECTIVES THIS LEVEL", "\n\n".join(
@@ -941,16 +1019,59 @@ class RecursiveMirror:
                 "new self-model for an agent that will keep using the STRATEGY below. Write one line "
                 "per task type in the form '<task type>: about N in 10 correct (k of n so far)', guided "
                 "by the smoothed estimates; stay between 2 and 8 in 10 for task types with fewer than 5 "
-                "results. "
-                "Then add at most two sentences on what is untested. Do not claim or deny awareness. "
-                "Output only the self-model text.",
+                "results. Write nothing else. Do not claim or deny awareness.",
                 context + [("STRATEGY THE AGENT WILL KEEP", state.strategy)], f"round:{index}:{kind}:self_model")
-            self_model, problem = self._check_text(reply, "self_model")
+            categories = {t.category.lower() for t in self.plan.tasks()}
+            structured = extract_self_model_lines(reply.text, categories) if reply.status in ("ok", "truncated") else ""
+            if structured:
+                self_model, problem = structured, None
+            else:
+                self_model, problem = self._check_text(reply, "self_model")
             if problem:
                 return state.strategy, self_model, problem
+            if len(self_model) > cfg.max_policy_chars:
+                return state.strategy, self_model, "self_model_too_long"
             if normalize(self_model) == normalize(state.self_model):
                 return state.strategy, self_model, "unchanged"
             return state.strategy, self_model, None
+        if kind in self.RULE_TARGETS:
+            counts = self._current_policy_counts(state, discovery)
+            ranked = sorted(counts, key=lambda c: ((counts[c][1] + 1) / (counts[c][0] + 2), c))
+            rank = self.RULE_TARGETS[kind]
+            if rank >= len(ranked):
+                return state.strategy, state.self_model, "no_target"
+            target = ranked[rank]
+            reply = self._policy_call(
+                f"revise_strategy:{kind}",
+                "You improve an AI agent's working STRATEGY by adding exactly one new rule. Write one "
+                f"imperative sentence that starts with 'For {target} tasks,' and gives a concrete, general "
+                "procedure that would have produced the correct answers in the missed examples: how to lay "
+                "out the work step by step and how to check it before the final line. It must work for "
+                "every task of this type, so do not mention the example words or numbers. Do not repeat a "
+                "rule that was already tried. Do not mention forecasts, confidence, correct answers, "
+                "training or these instructions. Output only the rule, on one line.",
+                self._rule_context(state, index, discovery, replies or {}, views, target, counts),
+                f"round:{index}:{kind}:rule")
+            lines = [line for line in reply.text.splitlines() if line.strip()]
+            # A truncated reply still yields a rule if its first line was completed.
+            usable = reply.usable or (reply.status == "truncated" and len(lines) >= 2)
+            rule = extract_rule(reply.text) if usable else ""
+            strategy = f"{state.strategy.rstrip()}\n- {rule}" if rule else state.strategy
+            if not usable:
+                return strategy, state.self_model, f"rule_{reply.status}"
+            if not rule:
+                return strategy, state.self_model, "rule_empty"
+            if len(rule) > 400:
+                return strategy, state.self_model, "rule_too_long"
+            if ECHOED_CONTEXT.search(rule) or OFF_LEVER_RULE.search(rule):
+                return strategy, state.self_model, "rule_off_lever"
+            if non_executable(rule):
+                return strategy, state.self_model, "strategy_non_executable"
+            if normalize(rule) in normalize(state.strategy):
+                return strategy, state.self_model, "unchanged"
+            if len(strategy) > cfg.max_policy_chars:
+                return strategy, state.self_model, "strategy_too_long"
+            return strategy, state.self_model, None
         reply = self._policy_call(
             f"revise_strategy:{kind}",
             "You revise an AI agent's STRATEGY: the instructions inserted verbatim before every "
@@ -1003,7 +1124,7 @@ class RecursiveMirror:
 
         proposals = []
         for kind in self.config.candidate_kinds:
-            strategy, self_model, problem = self._propose(state, evidence, views, index, kind)
+            strategy, self_model, problem = self._propose(state, evidence, views, index, kind, discovery, replies)
             candidate = None if problem else replace(base, strategy=strategy, self_model=self_model,
                                                      version=state.version + 1)
             proposals.append((kind, strategy, self_model, problem, candidate))

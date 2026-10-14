@@ -1,27 +1,35 @@
-# v0.10 validation (13-14 October 2026)
+# v0.11 validation (14 October 2026)
 
-**Status:** ready for its first real-model run, which has not happened yet.
-Every part of the inference path was exercised against the real
-`torch 2.14.1` and `transformers 4.57.6` libraries, with a tiny locally built
-Qwen2-architecture model on CPU. No real Qwen2.5-3B weights were available,
-because the container's network policy blocks huggingface.co.
+**Status:** v0.10 has run on the real model. v0.11 is ready for its first
+real-model run.
+
+- **v0.10 on a Colab A100** (Qwen2.5-3B-Instruct, bf16, 6 runs, about 4
+  minutes each) ran cleanly. The self-model improved itself and the gain
+  transferred in all six runs. The strategy did so in one of three plans. The
+  analysis is in [`docs/v0.10-a100-results.md`](docs/v0.10-a100-results.md).
+- **v0.11** changes how the strategy is revised (one appended rule per
+  proposal), based on that evidence. Its inference path is unchanged from
+  v0.10 and was re-tested below against the real libraries with a tiny
+  locally built Qwen2-architecture model on CPU. Real Qwen2.5-3B weights are
+  not available in this container, because its network policy blocks
+  huggingface.co.
 
 The real experiment is
-`release/v0.10.0/Digital_Mirror_Recursive_v0_10.ipynb` on a Colab GPU. Its
+`release/v0.11.0/Digital_Mirror_Recursive_v0_11.ipynb` on a Colab GPU. Its
 preflight cell is the first real-model check.
 
 ## Software checks
 
 ```text
 python -B -m unittest discover -s tests -v
-  Python 3.11, 3.12, 3.13 (standard library only): 111 tests, OK (7 opt-in skipped)
+  Python 3.11, 3.12, 3.13 (standard library only): 115 tests, OK (7 opt-in skipped)
 RECURSIVE_MIRROR_TEST_DEVICE=cpu python -B -m unittest discover -s tests
-  Python 3.12 + torch 2.14.1 + transformers 4.57.6: 111 tests, OK
+  Python 3.12 + torch 2.14.1 + transformers 4.57.6: 115 tests, OK
 ```
 
 | test module | tests | covers |
 |---|---|---|
-| test_core | 61 | the recursive engine (details below) |
+| test_core | 65 | the recursive engine (details below) |
 | test_runtime | 25 | checkpoints, the HF backend, the CLI, report wording, `--exclude-state` continuation |
 | test_tasks | 6 | `make-plan`, re-deriving every expected answer from the prompt text |
 | test_experiment | 6 | replicated runs, control arm, failure isolation, pooled statistics, CLI |
@@ -38,7 +46,10 @@ RECURSIVE_MIRROR_TEST_DEVICE=cpu python -B -m unittest discover -s tests
 - batching;
 - caching;
 - budgets, including wall-clock;
-- regression tests that replay each v0.8 Colab failure.
+- regression tests that replay each v0.8 Colab failure;
+- v0.11 rule proposals: target ranking, appending, screens for off-lever and
+  copied text, truncated replies, and structured self-model extraction from
+  replies that copy evidence after the per-type lines.
 
 `test_runtime` covers:
 
@@ -103,7 +114,9 @@ pooled analysis covers 144 held-out tasks.
 
 ## What this does not establish
 
-These checks establish software behaviour, not learning. It is still untested
-whether Qwen2.5-3B can improve its own strategy or self-model and transfer the
-gain to held-out tasks. In particular, it is untested whether it can do better
-than a hand-written step-by-step prompt. No awareness claim is made.
+These checks establish software behaviour, not learning. The v0.10 A100 run
+showed transferable self-improvement of the self-model, and of the strategy
+in one of three plans, for one 3B model and these task types. It did not beat
+a hand-written step-by-step prompt. Whether v0.11's appended rules improve
+the strategy more reliably is untested until the notebook runs. No awareness
+claim is made.

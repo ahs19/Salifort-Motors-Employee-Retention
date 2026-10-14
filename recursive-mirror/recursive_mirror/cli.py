@@ -50,7 +50,7 @@ def parser() -> argparse.ArgumentParser:
     experiment = commands.add_parser("experiment", help="Replicated runs over several generated plans, "
                                      "with an optional hand-written control start, and a pooled summary")
     experiment.add_argument("--seeds", type=_seeds, default=(2026, 2027, 2028))
-    experiment.add_argument("--rounds", type=int, default=3)
+    experiment.add_argument("--rounds", type=int, default=4)
     experiment.add_argument("--discovery", type=int, default=8)
     experiment.add_argument("--validation", type=int, default=24)
     experiment.add_argument("--final", type=int, default=48)

@@ -86,12 +86,12 @@ class ReleaseTests(unittest.TestCase):
         from recursive_mirror.runtime import load_plan
         from recursive_mirror.tasks import generate_plan
         model = type("M", (), {"identity": "budget-check"})()
-        plan = generate_plan(2026, rounds=3, discovery=12, validation=24, final=48)
-        engine = RecursiveMirror(model, plan, Config(max_depth=3, max_calls=720))
-        self.assertEqual(sum(engine._round_cost(r) for r in plan.rounds) + engine._final_reserve, 711)
+        plan = generate_plan(2026, rounds=4, discovery=12, validation=24, final=48)
+        engine = RecursiveMirror(model, plan, Config(max_depth=4, max_calls=1100))
+        self.assertEqual(sum(engine._round_cost(r) for r in plan.rounds) + engine._final_reserve, 1080)
         shipped = load_plan(Path(__file__).resolve().parents[1] / "examples" / "headroom.json")
-        engine = RecursiveMirror(model, shipped, Config(max_depth=2, max_calls=240))
-        self.assertEqual(sum(engine._round_cost(r) for r in shipped.rounds[:2]) + engine._final_reserve, 218)
+        engine = RecursiveMirror(model, shipped, Config(max_depth=2, max_calls=280))
+        self.assertEqual(sum(engine._round_cost(r) for r in shipped.rounds[:2]) + engine._final_reserve, 260)
 
     def test_committed_release_embeds_exactly_the_current_sources(self):
         releases = sorted((Path(__file__).resolve().parents[1] / "release").glob("*/BUILD_RECEIPT.json"))

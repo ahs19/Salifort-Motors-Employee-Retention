@@ -1,4 +1,4 @@
-# Digital Mirror: recursive self-improvement core v0.10
+# Digital Mirror: recursive self-improvement core v0.11
 
 The goal of this project is an AI that improves itself. The implementation is
 in **`recursive-mirror/`**, and its instructions are in
@@ -11,12 +11,27 @@ tasks, and committed only when it also transfers to a held-out task set. The
 agent remembers every attempted change and its measured outcome.
 
 **Run the experiment:** open
-[`recursive-mirror/release/v0.10.0/Digital_Mirror_Recursive_v0_10.ipynb` in Colab](https://colab.research.google.com/github/ahs19/Salifort-Motors-Employee-Retention/blob/claude/self-improve-ai-revision-3o1opd/recursive-mirror/release/v0.10.0/Digital_Mirror_Recursive_v0_10.ipynb).
+[`recursive-mirror/release/v0.11.0/Digital_Mirror_Recursive_v0_11.ipynb` in Colab](https://colab.research.google.com/github/ahs19/Salifort-Motors-Employee-Retention/blob/claude/self-improve-ai-revision-3o1opd/recursive-mirror/release/v0.11.0/Digital_Mirror_Recursive_v0_11.ipynb).
 Choose a GPU runtime, then *Runtime → Run all*. Upload the downloaded
 evidence zip for analysis.
 
 ## Version history
 
+- **v0.11 (14 October 2026).** Revised in response to the first real-model
+  run. The agent now improves its strategy by adding one rule at a time for
+  its weakest task types, instead of rewriting the whole strategy. It also
+  screens out proposals that copy their context, keeps only the per-type
+  lines of a self-model, and runs four levels. See
+  `recursive-mirror/docs/v0.10-a100-results.md`.
+- **v0.10 on a Colab A100 (14 October 2026).** The first real-model run with
+  Qwen2.5-3B-Instruct: 3 task plans × 2 arms, 144 pooled held-out tasks.
+  - The self-model improved itself and the gain transferred in all six runs
+    (Brier loss 0.328 → 0.198, p < 0.001).
+  - The strategy improved itself in one of three plans (held-out accuracy
+    60% → 77%, p ≈ 0.011).
+  - It did not beat a hand-written step-by-step prompt.
+
+  The evidence is in `recursive-mirror/evidence/v0.10.0-colab-a100-20261014/`.
 - **v0.10 (13-14 October 2026).** Hardened for the first real run:
   - the inference path checked against the real `torch` and `transformers`
     stack;

@@ -94,8 +94,10 @@ INITIAL = State("strategy-0", "self-model-0")
 
 def C(**kwargs):
     """Config for single-item mechanics tests: one task can never reach p <= 0.25,
-    so these tests switch the evidence bound off. EvidenceGateTests cover it."""
+    so these tests switch the evidence bound off (EvidenceGateTests cover it). They
+    exercise whole-strategy proposals; RuleProposalTests cover the add_rule kinds."""
     kwargs.setdefault("max_p_value", 1.0)
+    kwargs.setdefault("candidate_kinds", ("repair", "recalibrate"))
     return Config(**kwargs)
 
 
@@ -687,6 +689,111 @@ class BatchingTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "budget"):
             engine._call_many(requests)
         self.assertEqual(engine.calls, 16)
+
+
+def two_type_plan():
+    def task(name, category):
+        return Task(name, f"Solve the distinct item {name}.", "ok", category)
+    return Plan((Round((task("d-a1", "alpha"), task("d-b1", "beta"), task("d-b2", "beta")),
+                       tuple(task(f"v-{c}{i}", c) for c in ("alpha", "beta") for i in range(3))),
+                 Round((task("d-a2", "alpha"), task("d-b3", "beta")),
+                       tuple(task(f"w-{c}{i}", c) for c in ("alpha", "beta") for i in range(3)))),
+                tuple(task(f"f-{c}{i}", c) for c in ("alpha", "beta") for i in range(3)))
+
+
+def beta_needs_a_rule(req, parts):
+    """alpha is always solved; beta only once the strategy carries a beta rule."""
+    if req.purpose == "forecast":
+        return "60%"
+    category = parts["TASK"].splitlines()[0].removeprefix("Category: ")
+    solved = category == "alpha" or "beta-rule" in parts["STRATEGY"]
+    return "ANSWER: ok" if solved else "ANSWER: no"
+
+
+RULE_REPLIES = {"revise_strategy:add_rule": "1. For beta tasks, apply the beta-rule method and check it.",
+                "revise_strategy:add_rule_2": "For alpha tasks, keep doing what works.",
+                "revise_self_model:recalibrate": "alpha: about 8 in 10 correct (1 of 1 so far)"}
+
+
+class RuleProposalTests(unittest.TestCase):
+    """add_rule kinds: one rule for the weakest task types, appended to the strategy."""
+
+    def run_rules(self, replies=None, **config):
+        override = lambda req: (replies or RULE_REPLIES).get(req.purpose)  # noqa: E731
+        config.setdefault("candidate_kinds", ("add_rule", "add_rule_2", "recalibrate"))
+        config.setdefault("max_depth", 2)
+        return run_case(FakeModel(beta_needs_a_rule, override), two_type_plan(), C(**config))
+
+    def test_rule_targets_the_weakest_type_and_is_appended_to_the_strategy(self):
+        result, model, _, _ = self.run_rules()
+        step = result.steps[0]
+        self.assertEqual(step.selected_kind, "add_rule")
+        self.assertEqual(result.committed_state.strategy,
+                         INITIAL.strategy + "\n- For beta tasks, apply the beta-rule method and check it.")
+        self.assertTrue(result.transfer_improved)
+        first = next(r for r in model.requests if r.purpose == "revise_strategy:add_rule")
+        parts = sections(first.prompt)
+        self.assertTrue(parts["TARGET TASK TYPE"].startswith("beta: 0 of 2 correct"))
+        self.assertIn("For beta tasks,", first.system)
+        self.assertIn("Correct answer: ok", parts["MISSED EXAMPLES OF THIS TASK TYPE"])
+        self.assertNotIn("v-", first.prompt)   # validation and final tasks never appear
+        self.assertNotIn("f-", first.prompt)
+        second = next(r for r in model.requests if r.purpose == "revise_strategy:add_rule_2")
+        self.assertTrue(sections(second.prompt)["TARGET TASK TYPE"].startswith("alpha:"))
+
+    def test_rule_screens_and_truncation(self):
+        cases = {
+            "For beta tasks, set your forecasts to 30%.": "rule_off_lever",
+            "=== DISCOVERY RESULTS THIS LEVEL ===": "rule_off_lever",
+            "For beta tasks, compare with the reference answer.": "rule_off_lever",
+            "For beta tasks, " + "x" * 400: "rule_too_long",
+            "For beta tasks, retrain on more data.": "strategy_non_executable",
+            "   \n": "rule_empty",
+        }
+        for reply, reason in cases.items():
+            with self.subTest(reply=reply[:40]):
+                result, _, _, _ = self.run_rules({"revise_strategy:add_rule": reply},
+                                                 candidate_kinds=("add_rule",), max_depth=1)
+                self.assertEqual(result.steps[0].candidates[0].reason, reason)
+        INITIAL_WITH = replace(INITIAL, strategy="Solve each task carefully.")
+        override = {"revise_strategy:add_rule": "Solve each task carefully."}
+        result, _, _, _ = run_case(FakeModel(beta_needs_a_rule, lambda r: override.get(r.purpose)), two_type_plan(),
+                                   C(candidate_kinds=("add_rule",), max_depth=1), initial=INITIAL_WITH)
+        self.assertEqual(result.steps[0].candidates[0].reason, "unchanged")
+
+        def truncated(text):
+            def raise_it(req):
+                if req.purpose == "revise_strategy:add_rule":
+                    raise OutputTruncated("limit", text)
+                return None
+            return raise_it
+        for partial, reason in (("For beta tasks, apply the beta-rule method.\nNow let me also", "accuracy_gain"),
+                                ("For beta tasks, apply the beta-rule meth", "rule_truncated")):
+            with self.subTest(partial=partial):
+                result, _, _, _ = run_case(FakeModel(beta_needs_a_rule, truncated(partial)), two_type_plan(),
+                                           C(candidate_kinds=("add_rule",), max_depth=1))
+                self.assertEqual(result.steps[0].candidates[0].reason, reason)
+
+    def test_recalibrate_keeps_only_task_type_lines_even_when_truncated(self):
+        reply = ("alpha: about 9 in 10 correct (2 of 2 so far)\n- beta: about 2 in 10 correct (0 of 3 so far)\n"
+                 "\n=== DISCOVERY RESULTS THIS LEVEL ===\nTask: Solve the distinct item d-b1.\nalpha: duplicate")
+
+        def raise_it(req):
+            if req.purpose == "revise_self_model:recalibrate":
+                raise OutputTruncated("limit", reply)
+            return None
+
+        result, _, _, _ = run_case(FakeModel(beta_needs_a_rule, raise_it), two_type_plan(),
+                                   C(candidate_kinds=("recalibrate",), max_depth=1))
+        candidate = result.steps[0].candidates[0]
+        self.assertTrue(candidate.eligible)
+        self.assertEqual(candidate.self_model,
+                         "alpha: about 9 in 10 correct (2 of 2 so far)\nbeta: about 2 in 10 correct (0 of 3 so far)")
+
+    def test_whole_strategy_that_copies_the_evidence_is_ineligible(self):
+        replies = {"revise_strategy:repair": "STRATEGY:\n=== DISCOVERY RESULTS THIS LEVEL ===\n[1] beta | INCORRECT"}
+        result, _, _, _ = self.run_rules(replies, candidate_kinds=("repair",), max_depth=1)
+        self.assertEqual(result.steps[0].candidates[0].reason, "strategy_echoes_context")
 
 
 class IsolationAndScoringTests(unittest.TestCase):

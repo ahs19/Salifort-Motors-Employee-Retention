@@ -13,8 +13,8 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "0.10.0"
-NOTEBOOK_NAME = "Digital_Mirror_Recursive_v0_10.ipynb"
+VERSION = "0.11.0"
+NOTEBOOK_NAME = "Digital_Mirror_Recursive_v0_11.ipynb"
 ARCHIVE_NAME = f"digital-mirror-recursive-v{VERSION}.zip"
 
 
@@ -69,7 +69,7 @@ def make_notebook(archive: bytes) -> dict:
         cells.append({"cell_type": "code", "id": f"cell-{len(cells)}", "metadata": {}, "source": text.splitlines(True),
                       "outputs": [], "execution_count": None})
 
-    markdown("""# Digital Mirror v0.10: does the AI improve itself?\n
+    markdown("""# Digital Mirror v0.11: does the AI improve itself?\n
 **How to run.** *Runtime → Change runtime type →* pick a **GPU** (T4 works; L4 or A100 is faster) → *Save*.
 Then *Runtime → **Run all***. Keep this tab open. The last cell downloads `…_evidence.zip`:
 upload that file to Claude.
@@ -81,12 +81,14 @@ What the cells do, in order:
 3. run a short preflight with the real model (Qwen2.5-3B-Instruct, pinned
    revision) and print protocol diagnostics;
 4. run the experiment: for each of several independent task plans, the agent
-   recursively examines and rewrites its own strategy and self-model, keeping
-   only changes that pass paired tests on fresh tasks; then a held-out final
-   test. A control arm repeats this from a hand-written step-by-step prompt;
+   recursively examines itself, adds one rule at a time to its strategy for its
+   weakest task types and recalibrates its self-model, keeping only changes that
+   pass paired tests on fresh tasks; then a held-out final test. A control arm
+   repeats this from a hand-written step-by-step prompt;
 5. pool the held-out results across plans and export all evidence.
 
-Expected time with the default settings: about 2 hours on a T4, less on L4/A100.
+Expected time with the default settings: about 40 minutes on an A100, several hours on a T4
+(use fewer `SEEDS` or `ROUNDS` there).
 Use the settings cell to shorten it (for example fewer `SEEDS`).
 If any cell stops with an error, run the **last cell** by hand: it exports
 everything produced so far, including logs of the failure.
@@ -120,7 +122,7 @@ general self-improvement, changed weights, or subjective awareness.
         for name, meta in manifest["files"].items():
             assert len(data[name]) == meta["bytes"]
             assert hashlib.sha256(data[name]).hexdigest() == meta["sha256"], name
-        SESSION = Path("/content") / ("recursive_mirror_v0100_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8])
+        SESSION = Path("/content") / ("recursive_mirror_v0110_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8])
         SESSION.mkdir(exist_ok=False)
         PROJECT = SESSION / "project"
         PROJECT.mkdir()
@@ -141,8 +143,8 @@ general self-improvement, changed weights, or subjective awareness.
         REVISION = "aa8e72537993ba99e69dfaafa59ed015b17504d1"  # pinned commit of MODEL; change both together
         SEEDS = "2026,2027,2028"      # independent task plans; fewer seeds = shorter run, weaker evidence
         RUN_CONTROL = True            # also start from a hand-written step-by-step prompt
-        ROUNDS, DISCOVERY, VALIDATION, FINAL = 3, 12, 24, 48   # larger validation/final sets = more power
-        MAX_CALLS_PER_RUN = 720       # 3 levels need at most 711 calls with these sizes
+        ROUNDS, DISCOVERY, VALIDATION, FINAL = 4, 12, 24, 48   # rules accumulate over levels
+        MAX_CALLS_PER_RUN = 1100      # 4 levels x 3 candidates need at most 1080 calls with these sizes
         TOTAL_HOURS = 4.0             # wall-clock budget shared by all runs of the main experiment
         FORCE_AFTER_WEAK_PREFLIGHT = False  # True: run the experiment even if the preflight looks uninformative
         print({"model": MODEL, "seeds": SEEDS, "control": RUN_CONTROL, "hours": TOTAL_HOURS})

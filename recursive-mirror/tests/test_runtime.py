@@ -52,9 +52,11 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(result.transfer_improved)
         # Level 0 repairs the strategy; level 1 recalibrates the self-model to the new strategy.
         self.assertEqual([s.accepted for s in result.steps], [True, True])
-        self.assertEqual([s.selected_kind for s in result.steps], ["repair", "recalibrate"])
+        self.assertEqual([s.selected_kind for s in result.steps], ["add_rule", "recalibrate"])
+        # One task type only, so the second-weakest-type rule has no target.
         self.assertEqual([[c.reason for c in s.candidates] for s in result.steps],
-                         [["accuracy_gain", "calibration_gain"], ["unchanged", "calibration_gain"]])
+                         [["accuracy_gain", "no_target", "calibration_gain"],
+                          ["unchanged", "no_target", "calibration_gain"]])
         self.assertGreater(result.cache_hits, 0)
         self.assertEqual(result.model_identity, "scripted-test-double")
         self.assertEqual(load_checkpoint(output / "checkpoint.json"), result.committed_state)
@@ -68,7 +70,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("answered more held-out final tasks correctly (0% -> 100%) and was committed", report)
         self.assertIn("## Initial policy", report)
         self.assertIn(State().strategy, report)
-        self.assertIn("| repair | **selected** (`accuracy_gain`) | 0% -> 100%", report)
+        self.assertIn("| add_rule | **selected** (`accuracy_gain`) | 0% -> 100%", report)
         self.assertIn(ScriptedTestDouble.FIXED, report)
         self.assertIn("Nothing here certifies awareness", report)
 

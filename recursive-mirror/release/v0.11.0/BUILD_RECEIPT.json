@@ -1,0 +1,9 @@
+{
+  "version": "0.11.0",
+  "source_zip": "digital-mirror-recursive-v0.11.0.zip",
+  "source_sha256": "d4f77b7e705353997e273fc7016f6963735dbd3f81f7e3bf54bd4399b7c4494e",
+  "source_bytes": 103564,
+  "notebook": "Digital_Mirror_Recursive_v0_11.ipynb",
+  "notebook_sha256": "f39e2e3d527a63c015f1bf97774e3a900a9d57d46cdc3b7821ad1c5338e02b1c",
+  "packaged_files": 24
+}

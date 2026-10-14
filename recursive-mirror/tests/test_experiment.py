@@ -81,7 +81,7 @@ class ExperimentTests(unittest.TestCase):
         text = (self.root / "exp" / "summary.md").read_text(encoding="utf-8")
         self.assertIn("Selected policy vs its starting policy (self arm) | 12 |", text)
         self.assertEqual(json.loads((self.root / "exp" / "summary.json").read_text(encoding="utf-8")), summary)
-        self.assertTrue(any("level 0: selected repair" in line for line in lines))
+        self.assertTrue(any("level 0: selected add_rule" in line for line in lines))
         # The same analysis can be recomputed from the saved files alone.
         self.assertEqual(summarize(self.root / "exp"), summary)
 
