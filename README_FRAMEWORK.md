@@ -25,8 +25,10 @@ evidence zip for analysis.
   `recursive-mirror/docs/v0.10-a100-results.md`.
 - **v0.10 on a Colab A100 (14 October 2026).** The first real-model run with
   Qwen2.5-3B-Instruct: 3 task plans × 2 arms, 144 pooled held-out tasks.
-  - The self-model improved itself and the gain transferred in all six runs
-    (Brier loss 0.328 → 0.198, p < 0.001).
+  - The self-model corrected one blind spot, and the correction transferred.
+    It learned it cannot reverse words (pooled Brier loss 0.328 → 0.198,
+    p < 0.001; committed in 5 of 6 runs). It did not improve calibration
+    on the other task types.
   - The strategy improved itself in one of three plans (held-out accuracy
     60% → 77%, p ≈ 0.011).
   - It did not beat a hand-written step-by-step prompt.

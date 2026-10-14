@@ -4,9 +4,11 @@
 real-model run.
 
 - **v0.10 on a Colab A100** (Qwen2.5-3B-Instruct, bf16, 6 runs, about 4
-  minutes each) ran cleanly. The self-model improved itself and the gain
-  transferred in all six runs. The strategy did so in one of three plans. The
-  analysis is in [`docs/v0.10-a100-results.md`](docs/v0.10-a100-results.md).
+  minutes each) ran cleanly. The self-model learned, and transferred, that
+  the agent cannot reverse words (committed in 5 of 6 runs), but it did not
+  improve calibration on the other task types. The strategy improved in one
+  of three plans. The analysis and a reliability review are in
+  [`docs/v0.10-a100-results.md`](docs/v0.10-a100-results.md).
 - **v0.11** changes how the strategy is revised (one appended rule per
   proposal), based on that evidence. Its inference path is unchanged from
   v0.10 and was re-tested below against the real libraries with a tiny
@@ -115,8 +117,9 @@ pooled analysis covers 144 held-out tasks.
 ## What this does not establish
 
 These checks establish software behaviour, not learning. The v0.10 A100 run
-showed transferable self-improvement of the self-model, and of the strategy
-in one of three plans, for one 3B model and these task types. It did not beat
+showed one transferable self-model correction (word reversal) and a
+strategy improvement in one of three plans, for one 3B model and these task
+types. It did not beat
 a hand-written step-by-step prompt. Whether v0.11's appended rules improve
 the strategy more reliably is untested until the notebook runs. No awareness
 claim is made.

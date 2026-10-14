@@ -51,10 +51,14 @@ The first real-model run (v0.10, Qwen2.5-3B-Instruct on a Colab A100,
 analysed in [`docs/v0.10-a100-results.md`](docs/v0.10-a100-results.md), with
 the full evidence in `evidence/v0.10.0-colab-a100-20261014/`.
 
-- **The self-model improved itself and the gain transferred.** In all six
-  runs the agent's own rewritten self-model forecast its held-out success
-  better than its starting one: pooled Brier loss 0.328 → 0.198 (p < 0.001).
-- **The strategy improved itself once.** In one of three plans the agent
+- **The self-model corrected one blind spot, and the correction
+  transferred.** Pooled held-out Brier loss fell from 0.328 to 0.198
+  (p < 0.001), and a rewritten self-model was committed in 5 of 6 runs.
+  Almost all of that gain is word reversal: the agent learned it cannot
+  reverse words (forecast about 100% → 13%, accuracy 0%). Without word
+  reversal, the self arm's calibration got slightly worse (0.191 → 0.231).
+- **The strategy improved itself once,** and that one plan carries the whole
+  pooled accuracy result. In one of three plans the agent
   wrote itself a verification rule for multiplication. It passed validation,
   and held-out accuracy rose from 60% to 77% (9 wins, 1 loss, p ≈ 0.011).
   Held-out multiplication went from 2 of 8 to 8 of 8.
